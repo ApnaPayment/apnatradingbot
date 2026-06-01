@@ -47,8 +47,8 @@ class KotakNeoWSClient:
     """
 
     HEARTBEAT_INTERVAL = 30   # seconds
-    MAX_RECONNECT_WAIT = 60   # seconds
-    INITIAL_RECONNECT  = 5    # seconds
+    MAX_RECONNECT_WAIT = 300  # seconds — domain NXDOMAIN, retry slowly
+    INITIAL_RECONNECT  = 60   # seconds — don't spam logs
 
     def __init__(
         self,
