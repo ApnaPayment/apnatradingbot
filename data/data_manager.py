@@ -477,6 +477,7 @@ class DataManager:
         saved = 0
         for symbol in symbols:
             try:
+                time.sleep(0.3)   # 300ms between quotes — avoid Kotak 429 rate limit
                 q = self.get_live_quote(symbol, exchange)
                 if not q or q.get("ltp", 0) <= 0:
                     continue
