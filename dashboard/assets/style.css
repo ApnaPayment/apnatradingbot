@@ -1,0 +1,215 @@
+/* AlgoTrader Dash Theme — Clean Light Professional */
+
+:root {
+  --bg-page:      #f5f7fa;
+  --bg-card:      #ffffff;
+  --bg-sidebar:   #1e2a3a;
+  --border-color: #e2e8f0;
+  --profit-green: #16a34a;
+  --loss-red:     #dc2626;
+  --signal-gold:  #d97706;
+  --accent-blue:  #2563eb;
+  --text-dark:    #1e293b;
+  --text-muted:   #64748b;
+  --shadow:       0 1px 3px rgba(0,0,0,0.08);
+}
+
+body {
+  background-color: var(--bg-page);
+  color: var(--text-dark);
+  font-family: 'Inter', 'Roboto', sans-serif;
+  margin: 0;
+  padding: 0;
+}
+
+/* Cards */
+.card {
+  background-color: var(--bg-card);
+  border: 1px solid var(--border-color);
+  border-radius: 8px;
+  padding: 16px;
+  margin-bottom: 16px;
+  box-shadow: var(--shadow);
+}
+
+.card h5 {
+  margin: 0 0 12px 0;
+  color: var(--accent-blue);
+  font-size: 13px;
+  text-transform: uppercase;
+  font-weight: 600;
+  letter-spacing: 0.5px;
+}
+
+/* KPI */
+.kpi-value {
+  font-family: 'Roboto Mono', monospace;
+  font-size: 24px;
+  font-weight: 700;
+  letter-spacing: -0.5px;
+  color: var(--text-dark);
+}
+
+.kpi-profit { color: var(--profit-green); }
+.kpi-loss   { color: var(--loss-red); }
+
+.kpi-label {
+  color: var(--text-muted);
+  font-size: 11px;
+  text-transform: uppercase;
+  margin-top: 4px;
+  letter-spacing: 0.5px;
+}
+
+/* Status badges */
+.status-badge {
+  display: inline-block;
+  padding: 4px 8px;
+  border-radius: 4px;
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
+.status-running { background-color: #dcfce7; color: var(--profit-green); }
+.status-stopped { background-color: #fee2e2; color: var(--loss-red); }
+.status-paper   { background-color: #dbeafe; color: var(--accent-blue); }
+
+/* Table */
+.dash-table {
+  background-color: var(--bg-card);
+  border: 1px solid var(--border-color);
+  border-radius: 8px;
+  box-shadow: var(--shadow);
+}
+
+.dash-table--striped tr:nth-child(even) {
+  background-color: #f8fafc;
+}
+
+.dash-table th {
+  background-color: #f1f5f9;
+  color: var(--text-muted);
+  border-bottom: 2px solid var(--border-color);
+  font-weight: 600;
+  padding: 12px;
+  text-align: left;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
+.dash-table td {
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--border-color);
+  color: var(--text-dark);
+}
+
+.dash-table tr:hover { background-color: #f8fafc; }
+
+/* Inputs */
+input, select, textarea {
+  background-color: var(--bg-card);
+  color: var(--text-dark);
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  padding: 8px 12px;
+  font-size: 12px;
+}
+
+input:focus, select:focus, textarea:focus {
+  outline: none;
+  border-color: var(--accent-blue);
+  box-shadow: 0 0 0 3px rgba(37,99,235,0.1);
+}
+
+/* Buttons */
+.btn {
+  border-radius: 6px;
+  font-weight: 600;
+  font-size: 12px;
+  padding: 8px 16px;
+  border: none;
+  cursor: pointer;
+  transition: all 0.2s ease;
+}
+
+.btn-primary {
+  background-color: var(--accent-blue);
+  color: #ffffff;
+}
+
+.btn-primary:hover { opacity: 0.9; }
+
+/* Progress bars */
+.progress {
+  background-color: var(--border-color);
+  border-radius: 3px;
+  height: 6px;
+  margin: 8px 0;
+}
+
+.progress-bar {
+  background-color: var(--profit-green);
+  height: 100%;
+  border-radius: 3px;
+  transition: width 0.3s ease;
+}
+
+.progress-bar.warning { background-color: var(--signal-gold); }
+.progress-bar.danger  { background-color: var(--loss-red); }
+
+/* Signal feed */
+.event-item {
+  padding: 8px 10px;
+  border-left: 3px solid var(--border-color);
+  margin-bottom: 6px;
+  font-size: 12px;
+  background-color: #f8fafc;
+  border-radius: 0 4px 4px 0;
+}
+
+.event-item.signal-buy  { border-left-color: var(--profit-green); background-color: #f0fdf4; }
+.event-item.signal-sell { border-left-color: var(--loss-red);     background-color: #fef2f2; }
+.event-item.execution   { border-left-color: var(--accent-blue);  background-color: #eff6ff; }
+.event-item.warning     { border-left-color: var(--signal-gold);  background-color: #fffbeb; }
+
+.event-time    { color: var(--text-muted); font-family: 'Roboto Mono', monospace; font-size: 10px; }
+.event-message { color: var(--text-dark); margin: 2px 0; }
+
+/* Gauge */
+.gauge-value {
+  font-family: 'Roboto Mono', monospace;
+  font-weight: 700;
+  font-size: 18px;
+  color: var(--text-dark);
+}
+
+/* Loading */
+._dash-loading { display: none; }
+
+.dash-loading-container {
+  padding: 20px;
+  text-align: center;
+  color: var(--text-muted);
+}
+
+.dash-loading-container::after {
+  content: '⏳ Loading...';
+  display: block;
+  font-size: 12px;
+  margin-top: 8px;
+}
+
+/* Plotly charts — white background */
+.plotly, .plotly .plot-container {
+  background-color: transparent !important;
+}
+
+/* Responsive */
+@media (max-width: 768px) {
+  .card { padding: 12px; }
+  .kpi-value { font-size: 18px; }
+  .dash-table th, .dash-table td { padding: 8px; font-size: 11px; }
+}

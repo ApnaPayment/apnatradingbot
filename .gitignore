@@ -1,0 +1,40 @@
+# Secrets — NEVER commit
+.env
+*.env
+secrets.py
+
+# Python
+venv/
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Data & logs (large, local only)
+data/market_data.db
+data/*.csv
+data/*.json
+logs/
+*.log
+
+# Backtest output
+backtest/results/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+data/*.db
+data/*.db-shm
+data/*.db-wal
+trading.db
+scripts/
