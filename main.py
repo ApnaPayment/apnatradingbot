@@ -173,6 +173,7 @@ class AlgoTrader:
         self.trading_paused  = False    # Set True by morning brief if conditions are extreme
         self._calendar_ctx   = {}       # Refreshed once per trading cycle
         self._session_vetoes: set[str] = set()   # Phase 10: operator-blocked symbols
+        self._sl_cooldown: dict[str, datetime] = {}  # symbol → time SL was hit; blocks re-entry
         self._cmd_handler    = None     # Phase 10: Telegram command handler (started in startup)
         # ── Session-level stats (reset on bot start, used by /status and EOD report) ──
         import datetime as _dt
@@ -599,12 +600,25 @@ class AlgoTrader:
             logger.error(f"Trading cycle error: {e}", exc_info=True)
             self.telegram.alert_error(str(e), "trading_cycle")
 
+    _SL_COOLDOWN_MINUTES = 60  # block re-entry for 60 min after SL on same symbol
+
     def _process_signal(self, signal: TradeSignal):
         """Full pipeline: risk check → VIX gate → AI eval (with news) → execution."""
         # Phase 10: operator session veto takes priority over everything
         if signal.symbol in self._session_vetoes:
             logger.info(f"Session veto: skipping {signal.symbol}")
             return
+
+        # SL cooldown — block re-entry for 60 min after a stop-loss on the same symbol
+        _sl_hit_at = self._sl_cooldown.get(signal.symbol)
+        if _sl_hit_at:
+            _mins_since = (datetime.now() - _sl_hit_at).total_seconds() / 60
+            if _mins_since < self._SL_COOLDOWN_MINUTES:
+                logger.info(
+                    f"SL cooldown: {signal.symbol} blocked for "
+                    f"{self._SL_COOLDOWN_MINUTES - _mins_since:.0f} more min after SL"
+                )
+                return
 
         available = self.client.get_available_capital()
 
@@ -1027,6 +1041,7 @@ class AlgoTrader:
 
             if self.risk.check_stop_loss_hit(symbol, current_price):
                 logger.info(f"STOP LOSS HIT: {symbol} @ ₹{current_price}")
+                self._sl_cooldown[symbol] = datetime.now()
                 self._exit_position(symbol, pos, current_price, "stop_loss")
 
             elif self.risk.check_target_hit(symbol, current_price):
@@ -1061,6 +1076,7 @@ class AlgoTrader:
                 self._exit_fo_position(symbol, pos, current, "target_50pct")
             elif pnl_pct <= -0.30:
                 logger.info(f"F&O STOP 30%: {symbol} @ ₹{current}")
+                self._sl_cooldown[symbol] = datetime.now()
                 self._exit_fo_position(symbol, pos, current, "sl_30pct")
             elif self._fo_days_to_expiry(symbol) <= 1:
                 logger.info(f"F&O EXPIRY EXIT (1 day left): {symbol}")

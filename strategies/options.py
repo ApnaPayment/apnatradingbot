@@ -34,8 +34,8 @@ UNDERLYING_ETF = {
     "NIFTY":      "NIFTYBEES-EQ",
     "BANKNIFTY":  "BANKBEES-EQ",
     "SENSEX":     "HDFCSENSEX-EQ",
-    "FINNIFTY":   "BANKBEES-EQ",    # closest ETF proxy (financial services)
-    "MIDCPNIFTY": "NIFTYBEES-EQ",   # no midcap ETF on watchlist; use Nifty as proxy
+    # FINNIFTY and MIDCPNIFTY have no reliable ETF proxy on our watchlist.
+    # They use INDEX_QUOTE directly; ETF fallback is disabled for them.
 }
 
 # Index live-quote symbol + exchange (for ATM strike calculation)
@@ -106,7 +106,7 @@ class OptionsStrategy:
         self.strike_offset    = strike_offset
         self.min_trend_strength = min_trend_strength
         self.lot_size         = LOT_SIZES.get(self.underlying, 50)
-        self.etf_symbol       = UNDERLYING_ETF.get(self.underlying, "NIFTYBEES-EQ")
+        self.etf_symbol       = UNDERLYING_ETF.get(self.underlying)  # None if no ETF proxy
         self.fo_exchange      = FO_EXCHANGE.get(self.underlying, "nse_fo")
 
     # ─────────────────────────────────────────────────────────────────────────
@@ -118,7 +118,11 @@ class OptionsStrategy:
         Scan for an options entry opportunity.
         Returns a TradeSignal (product=NRML, exchange=nse_fo) or None.
         """
-        # Step 1: Get ETF OHLCV for trend
+        # Step 1: Get ETF OHLCV for trend (skip if no ETF proxy configured)
+        if not self.etf_symbol:
+            logger.debug(f"Options: no ETF proxy for {self.underlying}, skipping trend scan")
+            return None
+
         df = data_manager.get_ohlcv(self.etf_symbol, "nse_cm", limit=60)
         if len(df) < 25:
             logger.debug(f"Options: not enough ETF data for {self.etf_symbol}")
@@ -141,6 +145,9 @@ class OptionsStrategy:
         if idx_quote and idx_quote.get("ltp", 0) > 0:
             index_price = idx_quote["ltp"]
         else:
+            if not self.etf_symbol:
+                logger.warning(f"Options: index quote unavailable for {self.underlying}, no ETF fallback — skipping")
+                return None
             # Fallback: use last close from ETF OHLCV converted via known ratio
             # (NIFTYBEES ≈ NIFTY/100, BANKBEES ≈ BANKNIFTY/100)
             logger.warning(f"Options: index quote unavailable for {idx_sym}, falling back to ETF×100")
