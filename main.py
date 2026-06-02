@@ -39,6 +39,7 @@ from data.data_manager import DataManager
 from strategies.momentum import MomentumStrategy
 from strategies.mean_reversion import MeanReversionStrategy
 from strategies.options import OptionsStrategy
+from strategies.stock_options import StockOptionsStrategy, STOCK_OPTIONS_CONFIG
 from ai.decision_engine import AIDecisionEngine
 from ai.signal_aggregator import SignalAggregator
 from alerts.telegram_bot import TelegramAlerter
@@ -129,6 +130,7 @@ class AlgoTrader:
         self.client = KotakNeoClient()
         self.risk   = RiskManager(RiskConfig())
         self.data   = DataManager(self.client)
+        self.stock_options = StockOptionsStrategy()
         self.options_strategies = [
             OptionsStrategy(underlying="NIFTY"),
             OptionsStrategy(underlying="BANKNIFTY"),
@@ -570,6 +572,24 @@ class AlgoTrader:
             self._signals_today += len(signals[:2])
             for signal in signals[:2]:
                 try:
+                    # Option B: convert momentum equity signal → stock ATM option
+                    # Only for configured stocks when market is trending
+                    if (
+                        signal.strategy == "momentum"
+                        and signal.symbol in STOCK_OPTIONS_CONFIG
+                        and self._market_regime in ("trending_up", "trending_down")
+                    ):
+                        opt_signal = self.stock_options.convert(signal, self.data)
+                        if opt_signal:
+                            logger.info(
+                                f"StockOpt: converted {signal.symbol} {signal.action} "
+                                f"→ {opt_signal.symbol}"
+                            )
+                            self._process_signal(opt_signal)
+                            continue   # skip equity trade for this signal
+                        # No option found — fall through to equity trade
+                        logger.debug(f"StockOpt: no option found for {signal.symbol}, trading equity")
+
                     self._process_signal(signal)
                 except Exception as e:
                     logger.error(f"Error processing signal for {signal.symbol}: {e}", exc_info=True)
