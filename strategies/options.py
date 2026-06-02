@@ -39,7 +39,7 @@ UNDERLYING_ETF = {
 }
 
 # Index live-quote symbol + exchange (for ATM strike calculation)
-# The ETF trades at ~1/100th of the index; we need the actual index level for F&O strikes
+# Index live-quote is mandatory for strike calculation — ETF fallback disabled (ratio not exact)
 INDEX_QUOTE = {
     "NIFTY":      ("NIFTY",      "nse_cm"),
     "BANKNIFTY":  ("BANKNIFTY",  "nse_cm"),
@@ -145,13 +145,15 @@ class OptionsStrategy:
         if idx_quote and idx_quote.get("ltp", 0) > 0:
             index_price = idx_quote["ltp"]
         else:
-            if not self.etf_symbol:
-                logger.warning(f"Options: index quote unavailable for {self.underlying}, no ETF fallback — skipping")
-                return None
-            # Fallback: use last close from ETF OHLCV converted via known ratio
-            # (NIFTYBEES ≈ NIFTY/100, BANKBEES ≈ BANKNIFTY/100)
-            logger.warning(f"Options: index quote unavailable for {idx_sym}, falling back to ETF×100")
-            index_price = _etf_price * 100
+            # ETF×100 fallback is disabled — the ratio is NOT exactly 100.
+            # BANKBEES×100 = 55,735 while actual BANKNIFTY = 53,734 (2,000 pts error).
+            # A wrong spot price produces a deeply OTM strike → guaranteed loss.
+            # Skip the signal entirely if Kotak cannot serve the index spot.
+            logger.warning(
+                f"Options: index quote unavailable for {self.underlying} "
+                f"(LTP=0) — skipping to avoid wrong strike selection"
+            )
+            return None
 
         step = STRIKE_STEP.get(self.underlying, 50)
         atm_strike = round(index_price / step) * step
