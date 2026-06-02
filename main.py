@@ -731,6 +731,13 @@ class AlgoTrader:
             },
         }
 
+        # For options signals, replace generic calendar DTE with the contract's actual DTE
+        if signal.strategy == "options":
+            contract_dte = self._fo_days_to_expiry(signal.symbol)
+            market_context["calendar"]["days_to_expiry"] = contract_dte
+            market_context["calendar"]["expiry_day"]     = (contract_dte == 0)
+            market_context["calendar"]["expiry_week"]    = (contract_dte <= 2)
+
         # Phase 7: ML ensemble — predict win probability from historical patterns
         ml_pred = predict_win_probability(
             signal_conf=signal.confidence,
@@ -1152,18 +1159,49 @@ class AlgoTrader:
         }
 
     def _fo_days_to_expiry(self, symbol: str) -> int:
-        """Parse expiry from option symbol like NIFTY29MAY2526000CE → days left."""
+        """Parse expiry from Kotak option symbol → days left.
+
+        Two formats used by Kotak scrip master:
+          Monthly (BANKNIFTY/SENSEX): UNDERLYING + YYMMM + STRIKE + CE/PE
+            e.g. BANKNIFTY26JUN55700CE  → YY=26, MMM=JUN, last Thursday = 26 Jun 2026
+          Weekly (NIFTY/FINNIFTY):    UNDERLYING + YY + M + DD + STRIKE + CE/PE
+            e.g. NIFTY26605024000CE    → YY=26, M=6(Jun), DD=05 → 05 Jun 2026
+        """
         import re
-        m = re.search(r'(\d{2})([A-Z]{3})(\d{2,4})', symbol)
-        if not m:
-            return 99
-        day, mon, yr = m.group(1), m.group(2), m.group(3)
-        yr = f"20{yr}" if len(yr) == 2 else yr
-        try:
-            expiry = datetime.strptime(f"{day}{mon}{yr}", "%d%b%Y").date()
-            return (expiry - datetime.now().date()).days
-        except Exception:
-            return 99
+
+        # Monthly format: 2-digit-year + 3-letter-month, followed by 4-6 digit strike
+        # BANKNIFTY/SENSEX monthly options expire on the last Thursday of the month
+        m = re.search(r'(\d{2})([A-Z]{3})(\d{4,6})(?:CE|PE)', symbol)
+        if m:
+            yr_str, mon_str = m.group(1), m.group(2)
+            try:
+                from datetime import date as date_cls, timedelta
+                yr  = int(f"20{yr_str}")
+                mon = datetime.strptime(mon_str, "%b").month
+                # Last Thursday of the month
+                if mon == 12:
+                    last_day = date_cls(yr + 1, 1, 1) - timedelta(days=1)
+                else:
+                    last_day = date_cls(yr, mon + 1, 1) - timedelta(days=1)
+                days_back = (last_day.weekday() - 3) % 7  # 3 = Thursday
+                expiry = last_day - timedelta(days=days_back)
+                return (expiry - datetime.now().date()).days
+            except Exception:
+                pass
+
+        # Weekly format: 2-digit-year + single-char-month-code + 2-digit-day
+        m2 = re.search(r'(\d{2})([1-9OND])(\d{2})(\d{4,6})(?:CE|PE)', symbol)
+        if m2:
+            yr_str, mon_code, day_str = m2.group(1), m2.group(2), m2.group(3)
+            month_map = {"O": 10, "N": 11, "D": 12}
+            try:
+                mon = month_map.get(mon_code, int(mon_code))
+                expiry = datetime(int(f"20{yr_str}"), mon, int(day_str)).date()
+                return (expiry - datetime.now().date()).days
+            except Exception:
+                pass
+
+        return 99
 
     def _exit_fo_position(self, symbol: str, pos: dict, exit_price: float, reason: str):
         """Exit an F&O (NRML) position and send Telegram alert."""
