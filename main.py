@@ -132,6 +132,8 @@ class AlgoTrader:
         self.options_strategies = [
             OptionsStrategy(underlying="NIFTY"),
             OptionsStrategy(underlying="BANKNIFTY"),
+            OptionsStrategy(underlying="FINNIFTY"),
+            OptionsStrategy(underlying="MIDCPNIFTY"),
             # SENSEX disabled: HDFCSENSEX ETF uses 1/1000 ratio, not 1/100.
             # ETF×100 gives ~8,451 vs real SENSEX ~82,000 → strikes 135 OTM.
             # Re-enable only when live SENSEX index quote is available.

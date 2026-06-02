@@ -31,33 +31,39 @@ logger = logging.getLogger(__name__)
 
 # Default underlying → proxy ETF for OHLCV-based trend reading (NOT for strike calc)
 UNDERLYING_ETF = {
-    "NIFTY":     "NIFTYBEES-EQ",
-    "BANKNIFTY": "BANKBEES-EQ",
-    "SENSEX":    "HDFCSENSEX-EQ",
+    "NIFTY":      "NIFTYBEES-EQ",
+    "BANKNIFTY":  "BANKBEES-EQ",
+    "SENSEX":     "HDFCSENSEX-EQ",
+    "FINNIFTY":   "BANKBEES-EQ",    # closest ETF proxy (financial services)
+    "MIDCPNIFTY": "NIFTYBEES-EQ",   # no midcap ETF on watchlist; use Nifty as proxy
 }
 
 # Index live-quote symbol + exchange (for ATM strike calculation)
 # The ETF trades at ~1/100th of the index; we need the actual index level for F&O strikes
 INDEX_QUOTE = {
-    "NIFTY":     ("NIFTY",     "nse_cm"),
-    "BANKNIFTY": ("BANKNIFTY", "nse_cm"),
-    "SENSEX":    ("SENSEX",    "bse_cm"),
+    "NIFTY":      ("NIFTY",      "nse_cm"),
+    "BANKNIFTY":  ("BANKNIFTY",  "nse_cm"),
+    "SENSEX":     ("SENSEX",     "bse_cm"),
+    "FINNIFTY":   ("FINNIFTY",   "nse_cm"),
+    "MIDCPNIFTY": ("MIDCPNIFTY", "nse_cm"),
 }
 
 # F&O exchange per underlying
 FO_EXCHANGE = {
-    "NIFTY":     "nse_fo",
-    "BANKNIFTY": "nse_fo",
-    "SENSEX":    "bse_fo",   # BSE derivatives
-    "FINNIFTY":  "nse_fo",
-    "MIDCPNIFTY":"nse_fo",
+    "NIFTY":      "nse_fo",
+    "BANKNIFTY":  "nse_fo",
+    "SENSEX":     "bse_fo",
+    "FINNIFTY":   "nse_fo",
+    "MIDCPNIFTY": "nse_fo",
 }
 
 # Strike step (round to nearest N for ATM)
 STRIKE_STEP = {
-    "NIFTY":     50,
-    "BANKNIFTY": 100,
-    "SENSEX":    100,
+    "NIFTY":      50,
+    "BANKNIFTY":  100,
+    "SENSEX":     100,
+    "FINNIFTY":   50,
+    "MIDCPNIFTY": 25,
 }
 
 # Lot sizes (SEBI periodically revises these — check NSE if in doubt)
