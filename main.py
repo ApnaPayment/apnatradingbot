@@ -91,18 +91,30 @@ NSE_HOLIDAYS: set[date] = {
 # Watchlist — edit this to your preferred stocks
 # ─────────────────────────────────────────────────────────────────────────────
 WATCHLIST = [
-    # Large-cap stocks
+    # Large-cap stocks — original
     "RELIANCE-EQ", "TCS-EQ", "INFY-EQ", "HDFCBANK-EQ",
     "ICICIBANK-EQ", "WIPRO-EQ", "LT-EQ", "AXISBANK-EQ",
-    # Added: high volume / diversification
-    "SBIN-EQ",        # Highest volume on NSE, good ATR
-    "BHARTIARTL-EQ",  # Telecom — low correlation to IT/banking
-    "BAJFINANCE-EQ",  # NBFC — high ATR, different regime behaviour
+    "SBIN-EQ", "BHARTIARTL-EQ", "BAJFINANCE-EQ",
+    # IT
+    "HCLTECH-EQ",
+    # Banking
+    "KOTAKBANK-EQ",
+    # Auto
+    "MARUTI-EQ", "TATAMOTORS-EQ",
+    # Consumer / Retail
+    "TITAN-EQ", "HINDUNILVR-EQ",
+    # Conglomerate
+    "ADANIENT-EQ",
+    # Pharma
+    "SUNPHARMA-EQ",
+    # Cement / Infra
+    "ULTRACEMCO-EQ",
+    # Power / PSU
+    "NTPC-EQ", "POWERGRID-EQ",
+    # Metals
+    "TATASTEEL-EQ",
     # Index ETFs
-    "NIFTYBEES-EQ",   # Nifty 50
-    "BANKBEES-EQ",    # Bank Nifty
-    "HDFCSENSEX-EQ",  # Sensex
-    "ITBEES-EQ",      # IT sector
+    "NIFTYBEES-EQ", "BANKBEES-EQ", "HDFCSENSEX-EQ", "ITBEES-EQ",
 ]
 
 
