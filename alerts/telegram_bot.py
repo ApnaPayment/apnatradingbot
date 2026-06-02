@@ -96,11 +96,11 @@ class TelegramAlerter:
 
         # Build bullet points from concerns (max 4), or fall back to reasoning snippet
         if concerns:
-            bullets = "\n".join(f"  • {c[:80]}" for c in concerns[:4])
+            bullets = "\n".join(f"  • {c}" for c in concerns[:4])
         else:
             # Chunk reasoning into short bullets
             sentences = [s.strip() for s in reasoning.replace(". ", ".|").split("|") if s.strip()]
-            bullets = "\n".join(f"  • {s[:80]}" for s in sentences[:3])
+            bullets = "\n".join(f"  • {s}" for s in sentences[:3])
 
         tools_line = f"🔧 Verified via: {', '.join(tools_used)}\n" if tools_used else ""
 

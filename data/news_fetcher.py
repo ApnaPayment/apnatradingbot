@@ -34,7 +34,7 @@ _HEADERS = {
     "Connection":      "keep-alive",
 }
 
-_TIMEOUT = 3  # seconds — keep short so a hung NSE call doesn't block the trading cycle
+_TIMEOUT = 8  # seconds — NSE can be slow from VPS; 3s caused frequent timeouts
 
 
 class NewsFetcher:
@@ -66,12 +66,9 @@ class NewsFetcher:
         if cached is not None:
             return cached
 
-        for attempt in range(2):
+        for attempt in range(3):
             try:
-                if attempt == 1:
-                    # Force cookie refresh on retry
-                    self._cookie_loaded = False
-                self._ensure_cookies()
+                self._ensure_cookies(force=(attempt > 0))
                 resp = self._session.get(_NSE_INDICES_URL, timeout=_TIMEOUT)
                 resp.raise_for_status()
                 data = resp.json()
@@ -81,11 +78,11 @@ class NewsFetcher:
                         self._set_cache("india_vix", vix, ttl=300)
                         logger.info(f"India VIX: {vix:.2f}")
                         return vix
-                # Empty or missing — force cookie refresh on next attempt
+                # Data returned but VIX row missing — force cookie refresh and retry
                 self._cookie_loaded = False
             except Exception as e:
-                if attempt == 1:
-                    logger.warning(f"VIX fetch failed after retry: {e}")
+                if attempt == 2:
+                    logger.warning(f"VIX fetch failed after {attempt+1} attempts: {e}")
         return None
 
     def get_fii_dii_flows(self) -> dict:
@@ -216,9 +213,9 @@ class NewsFetcher:
     # NSE cookie management (NSE returns 403 without a valid session cookie)
     # ─────────────────────────────────────────────────────────────────────────
 
-    def _ensure_cookies(self):
-        """Hit the NSE homepage once to get a session cookie."""
-        if self._cookie_loaded:
+    def _ensure_cookies(self, force: bool = False):
+        """Hit the NSE homepage to get/refresh a session cookie."""
+        if self._cookie_loaded and not force:
             return
         try:
             self._session.get("https://www.nseindia.com", timeout=_TIMEOUT)
