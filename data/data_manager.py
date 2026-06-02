@@ -33,7 +33,7 @@ class DataManager:
 
         # Enable WAL mode for better concurrency and configure timeouts
         try:
-            conn = sqlite3.connect(DB_PATH, timeout=5.0)
+            conn = sqlite3.connect(DB_PATH, timeout=30.0)
             conn.execute("PRAGMA journal_mode=WAL")
             conn.execute("PRAGMA synchronous=NORMAL")  # Balance safety and speed
             conn.execute("PRAGMA busy_timeout=300000")  # 5min timeout on lock (scrip master download takes 3-4 min)
@@ -1122,7 +1122,7 @@ class DataManager:
                 "DELETE FROM events WHERE timestamp < datetime('now', ? || ' days')",
                 (f"-{events_days}",)
             ).rowcount
-            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            conn.execute("PRAGMA wal_checkpoint(PASSIVE)")  # TRUNCATE needs exclusive lock; PASSIVE is safe with concurrent readers
         logger.info(
             f"DB cleanup: removed {tick_deleted} old ticks, {events_deleted} old events"
         )
