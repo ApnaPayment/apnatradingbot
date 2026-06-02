@@ -101,7 +101,7 @@ WATCHLIST = [
     # Banking
     "KOTAKBANK-EQ",
     # Auto
-    "MARUTI-EQ", "TATAMOTORS-EQ",
+    "MARUTI-EQ", "TATAPOWER-EQ",
     # Consumer / Retail
     "TITAN-EQ", "HINDUNILVR-EQ",
     # Conglomerate
