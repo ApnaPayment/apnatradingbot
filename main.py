@@ -1007,6 +1007,8 @@ class AlgoTrader:
                         underlying=_underlying,
                         days_to_expiry=_days_left,
                         paper=self.client.paper_trading,
+                        stop_loss=signal.stop_loss,
+                        target=signal.target,
                     )
                 else:
                     self.telegram.alert_order_placed(

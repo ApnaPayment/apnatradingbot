@@ -453,15 +453,23 @@ class TelegramAlerter:
     def alert_fo_trade(self, symbol: str, action: str, qty: int,
                        premium: float, strike: int, expiry, option_type: str,
                        underlying: str, days_to_expiry: int,
-                       exit_reason: str = None, paper: bool = True):
+                       exit_reason: str = None, paper: bool = True,
+                       stop_loss: float = None, target: float = None):
         """Alert for F&O options trade entry or exit."""
         lot_cost = premium * qty
+        is_sell  = (action == "SELL")
+
         if exit_reason:
             reason_map = {
-                "target_50pct": "🎯 Target Hit (50% gain)",
-                "sl_30pct":     "🛑 Stop Loss (30% loss)",
-                "expiry_exit":  "📅 Expiry Exit (1 day left)",
-                "eod_squareoff":"🔔 EOD Square-off",
+                # SELL (short option) exit reasons
+                "target_70pct":  "🎯 Target Hit — premium decayed 70% (kept 70% of credit)",
+                "sl_100pct":     "🛑 Stop Loss — premium doubled (100% loss on credit)",
+                # BUY (long option) exit reasons
+                "target_50pct":  "🎯 Target Hit (50% gain)",
+                "sl_30pct":      "🛑 Stop Loss (30% loss)",
+                # Common
+                "expiry_exit":   "📅 Expiry Exit (1 day left)",
+                "eod_squareoff": "🔔 EOD Square-off",
             }
             reason_label = reason_map.get(exit_reason, exit_reason)
             msg = (
@@ -473,16 +481,31 @@ class TelegramAlerter:
             )
         else:
             ot_emoji = "📈" if option_type == "CE" else "📉"
-            sl_price  = round(premium * (1 - 0.30), 2)
-            tgt_price = round(premium * (1 + 0.50), 2)
-            mode_tag  = "PAPER " if paper else ""
+            mode_tag = "PAPER " if paper else ""
+
+            if is_sell:
+                # Short option: SL = premium rises (bad), Target = premium falls (good)
+                sl_price  = stop_loss if stop_loss else round(premium * 2.00, 2)   # doubles → stop
+                tgt_price = target    if target    else round(premium * 0.30, 2)   # 70% decay → profit
+                sl_label  = f"₹{sl_price:.2f} (buy back if premium doubles)"
+                tgt_label = f"₹{tgt_price:.2f} (buy back when 70% decayed — keep ₹{(premium-tgt_price)*qty:,.0f})"
+                credit_note = f"💳 Credit received: ₹{lot_cost:,.0f} (profit if premium decays)\n"
+            else:
+                sl_price  = stop_loss if stop_loss else round(premium * 0.70, 2)
+                tgt_price = target    if target    else round(premium * 1.50, 2)
+                sl_label  = f"₹{sl_price:.2f} (30% loss)"
+                tgt_label = f"₹{tgt_price:.2f} (50% gain)"
+                credit_note = ""
+
             msg = (
                 f"{ot_emoji} <b>{mode_tag}{action} {option_type} — {underlying} {strike} {option_type}</b>\n"
                 f"{'─' * 28}\n"
                 f"🏷 Symbol: <code>{symbol}</code>\n"
                 f"📅 Expiry: {expiry} ({days_to_expiry} days)\n"
                 f"💰 Premium: ₹{premium:.2f} × {qty} = ₹{lot_cost:,.0f}\n"
-                f"🛡 SL: ₹{sl_price:.2f} (30% loss) | 🎯 Target: ₹{tgt_price:.2f} (50% gain)\n"
+                f"{credit_note}"
+                f"🛡 SL: {sl_label}\n"
+                f"🎯 Target: {tgt_label}\n"
                 f"⏰ {datetime.now().strftime('%H:%M:%S')}"
             )
         self.send(msg)
