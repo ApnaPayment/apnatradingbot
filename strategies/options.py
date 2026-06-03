@@ -31,12 +31,14 @@ logger = logging.getLogger(__name__)
 # ─── Constants ────────────────────────────────────────────────────────────────
 
 # Default underlying → proxy ETF for OHLCV-based trend reading (NOT for strike calc)
+# FINNIFTY and MIDCPNIFTY are highly correlated to NIFTY (~0.95+) so NIFTYBEES is a
+# valid trend proxy. Strike calculation always uses the actual index live quote.
 UNDERLYING_ETF = {
     "NIFTY":      "NIFTYBEES-EQ",
     "BANKNIFTY":  "BANKBEES-EQ",
     "SENSEX":     "HDFCSENSEX-EQ",
-    # FINNIFTY and MIDCPNIFTY have no reliable ETF proxy on our watchlist.
-    # They use INDEX_QUOTE directly; ETF fallback is disabled for them.
+    "FINNIFTY":   "NIFTYBEES-EQ",    # NIFTY proxy — highly correlated
+    "MIDCPNIFTY": "NIFTYBEES-EQ",    # NIFTY proxy — highly correlated
 }
 
 # Index live-quote symbol + exchange (for ATM strike calculation)
@@ -107,7 +109,8 @@ MAX_PREMIUM = 700       # default fallback if underlying not in map above
 MAX_PREMIUM_PER_LOT = 20_000  # raised from ₹15k — NIFTY 75 lots × ₹250 = ₹18,750
 
 
-SIGNAL_COOLDOWN_SECONDS = 600  # 10 minutes — suppress duplicate signals on same option symbol
+SIGNAL_COOLDOWN_SECONDS    = 600   # 10 min — suppress duplicate signals on same option symbol
+UNDERLYING_COOLDOWN_SECONDS = 1800  # 30 min — one signal per underlying per 30 min
 
 
 class OptionsStrategy:
@@ -121,8 +124,9 @@ class OptionsStrategy:
       4. Generate TradeSignal with SL and target priced in premium terms
     """
 
-    # Class-level cooldown tracker: option_symbol → last signal datetime
-    _last_signal_time: dict = {}
+    # Class-level cooldown trackers
+    _last_signal_time:     dict = {}   # option_symbol → last signal datetime (10 min)
+    _last_underlying_time: dict = {}   # underlying   → last signal datetime (30 min)
 
     def __init__(self,
                  underlying: str = "NIFTY",
@@ -266,8 +270,21 @@ class OptionsStrategy:
             f"Premium=₹{premium:.2f}/unit. Lot cost=₹{lot_cost:,.0f}."
         )
 
-        # Bug fix: suppress duplicate signals for the same option symbol within cooldown window
         from datetime import datetime as _datetime
+
+        # Underlying-level 30-min cooldown — one signal per underlying per 30 min
+        # Prevents NIFTY CE at 09:30 and NIFTY PE at 09:35 both firing in quick succession
+        last_ul = OptionsStrategy._last_underlying_time.get(self.underlying)
+        if last_ul is not None:
+            elapsed_ul = (_datetime.now() - last_ul).total_seconds()
+            if elapsed_ul < UNDERLYING_COOLDOWN_SECONDS:
+                logger.debug(
+                    f"Options underlying cooldown for {self.underlying} "
+                    f"({elapsed_ul:.0f}s < {UNDERLYING_COOLDOWN_SECONDS}s) — skipping"
+                )
+                return None
+
+        # Per-symbol 10-min cooldown — suppress duplicate signal on same option contract
         last_sig = OptionsStrategy._last_signal_time.get(option_symbol)
         if last_sig is not None:
             elapsed = (_datetime.now() - last_sig).total_seconds()
@@ -277,7 +294,9 @@ class OptionsStrategy:
                     f"({elapsed:.0f}s < {SIGNAL_COOLDOWN_SECONDS}s) — skipping"
                 )
                 return None
-        OptionsStrategy._last_signal_time[option_symbol] = _datetime.now()
+
+        OptionsStrategy._last_underlying_time[self.underlying] = _datetime.now()
+        OptionsStrategy._last_signal_time[option_symbol]       = _datetime.now()
 
         logger.info(
             f"Options signal: SELL {option_symbol} @ ₹{premium:.2f}"
