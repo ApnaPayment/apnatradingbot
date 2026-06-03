@@ -81,63 +81,88 @@ LOT_SIZES = {
 # Minimum days to expiry before we refuse to enter new positions
 MIN_DAYS_TO_EXPIRY = 2
 
-# ── SELL mode (option writing) ────────────────────────────────────────────────
-# Strategy: SELL CE when bearish (collect premium, profit if market stays flat/falls)
-#           SELL PE when bullish (collect premium, profit if market stays flat/rises)
-# Exit rules for short options:
-#   Target : premium decays to 30% of received → buy back cheap → keep 70% of premium
-#   Stop   : premium rises to 200% of received → buy back expensive → cap loss at 100%
-# P&L for SELL: positive when premium falls, negative when premium rises
-STOP_LOSS_PCT  = 1.00   # buy back if premium doubles (100% loss on received premium)
-TARGET_PCT     = 0.70   # buy back when 70% of premium has decayed (keep 70% of credit)
+# ── Dual-mode strategy ────────────────────────────────────────────────────────
+#
+# MODE 1 — BUY directional (strong trend, strength > BUY_STRENGTH_THRESHOLD)
+#   BUY CE when strongly bullish  → profit from the upside move
+#   BUY PE when strongly bearish  → profit from the downside move
+#   Target : premium rises 100%   (2× entry)       → R:R = 3.3:1  ✅
+#   Stop   : premium falls 30%    (lose 30% paid)
+#
+# MODE 2 — SELL OTM theta decay (moderate trend, strength 65–80%)
+#   SELL CE when moderately bearish → collect premium, profit if mkt stays flat/falls
+#   SELL PE when moderately bullish → collect premium, profit if mkt stays flat/rises
+#   Strike : 1 step OTM from ATM  → delta ~0.25, probability of profit ~75%
+#   Target : premium decays to 30% of received → keep 70% of credit
+#   Stop   : premium rises to 200% of received → cap loss at 100% of credit received
+#   Win rate target: 70%+ (structural for 1-OTM strikes with delta <0.30)
+#
+# KEY RULE: BUY mode fires when trend is STRONG. SELL mode fires when trend is MODERATE.
+# This prevents the bot from selling premium during fast-moving directional days.
+
+BUY_STRENGTH_THRESHOLD  = 0.80   # strength ≥ 80% → BUY mode (big move expected)
+SELL_STRENGTH_MIN       = 0.65   # strength 65–79% → SELL mode (moderate, theta play)
+SELL_STRENGTH_MAX       = 0.79   # above this, switch to BUY mode
+
+# BUY mode exit levels (% of premium paid)
+BUY_TARGET_PCT  = 1.00   # target = 100% gain on premium (2× entry)
+BUY_STOP_PCT    = 0.30   # stop   = 30% loss on premium
+
+# SELL mode exit levels (% of premium received)
+SELL_STOP_PCT   = 1.00   # buy back if premium doubles (100% loss on received premium)
+SELL_TARGET_PCT = 0.70   # buy back when 70% decayed (keep 70% of credit)
+
+# SELL mode: how many strikes OTM to go (1 = one step outside ATM)
+# 1-OTM gives delta ~0.25–0.30, probability of profit ~72–75%
+SELL_STRIKE_OFFSET = 1
 
 # Premium bounds per unit (₹)
-# Too cheap = deep OTM with near-zero delta; too expensive = capital risk per lot is excessive.
-# Per-underlying caps based on actual observed premiums (June 2026 audit):
-#   NIFTY weekly ATM:    ₹150–₹350  (75 lots × ₹350 = ₹26k lot cost — fits ₹1L budget)
-#   BANKNIFTY monthly:  ₹400–₹700  (15 lots × ₹700 = ₹10.5k lot cost — fits ₹1L budget)
-#   Generic floor:       ₹80 — below this is deep OTM with near-zero delta
 MIN_PREMIUM = 50
 MAX_PREMIUM_PER_UNDERLYING = {
-    "NIFTY":      700,   # NIFTY ~23k level: ATM premium ~₹200-500; raised from 500
-    "BANKNIFTY":  1500,  # BANKNIFTY ~53k level: ATM premium ~₹900-1400; raised from 700
-    "SENSEX":     800,   # SENSEX premiums: similar to NIFTY scale
+    "NIFTY":      700,
+    "BANKNIFTY":  1500,
+    "SENSEX":     800,
     "FINNIFTY":   400,
     "MIDCPNIFTY": 400,
 }
-MAX_PREMIUM = 700       # default fallback if underlying not in map above
-MAX_PREMIUM_PER_LOT = 20_000  # raised from ₹15k — NIFTY 75 lots × ₹250 = ₹18,750
+MAX_PREMIUM = 700
+MAX_PREMIUM_PER_LOT = 20_000
 
-
-SIGNAL_COOLDOWN_SECONDS    = 600   # 10 min — suppress duplicate signals on same option symbol
-UNDERLYING_COOLDOWN_SECONDS = 1800  # 30 min — one signal per underlying per 30 min
+# Cooldowns — max 1 signal per underlying PER DAY (not per 30 min)
+# Options are held for days, not minutes. Multiple signals/day = overtrading.
+SIGNAL_COOLDOWN_SECONDS     = 600    # 10 min — suppress exact duplicate on same symbol
+UNDERLYING_DAILY_CAP        = 1      # max 1 trade per underlying per trading day
 
 
 class OptionsStrategy:
     """
-    Directional options strategy for index options (Nifty / BankNifty).
+    Dual-mode directional options strategy for index options (Nifty / BankNifty).
+
+    Mode selection (auto, based on trend strength):
+      Strong trend  (≥80%)  → BUY directional CE/PE → profit from the move   R:R 3.3:1
+      Moderate trend (65–79%) → SELL 1-OTM CE/PE   → collect theta decay     Win% ~73%
+      Weak (<65%)            → no trade
 
     Entry logic:
-      1. Read trend of the index ETF from OHLCV (EMA 9/21 + RSI)
-      2. Confirm strong trend (not ranging)
-      3. Find ATM or 1-OTM strike in scrip master for nearest valid expiry
-      4. Generate TradeSignal with SL and target priced in premium terms
+      1. Read trend from index ETF OHLCV (EMA 9/21 + RSI)
+      2. Determine mode from strength
+      3. Find correct strike (ATM for BUY, 1-OTM for SELL)
+      4. Return TradeSignal with correct action, SL, target for that mode
     """
 
-    # Class-level cooldown trackers
-    _last_signal_time:     dict = {}   # option_symbol → last signal datetime (10 min)
-    _last_underlying_time: dict = {}   # underlying   → last signal datetime (30 min)
+    # Class-level trackers
+    _last_signal_time:       dict = {}   # option_symbol → last signal datetime
+    _last_underlying_time:   dict = {}   # underlying → last signal datetime (10-min dedup)
+    _daily_trades_per_ul:    dict = {}   # underlying → (date, count) — daily cap
 
     def __init__(self,
                  underlying: str = "NIFTY",
-                 strike_offset: int = 0,         # 0 = ATM, 1 = 1 OTM, -1 = 1 ITM
                  min_trend_strength: float = 0.65):
-        self.underlying       = underlying.upper()
-        self.strike_offset    = strike_offset
+        self.underlying         = underlying.upper()
         self.min_trend_strength = min_trend_strength
-        self.lot_size         = LOT_SIZES.get(self.underlying, 50)
-        self.etf_symbol       = UNDERLYING_ETF.get(self.underlying)  # None if no ETF proxy
-        self.fo_exchange      = FO_EXCHANGE.get(self.underlying, "nse_fo")
+        self.lot_size           = LOT_SIZES.get(self.underlying, 50)
+        self.etf_symbol         = UNDERLYING_ETF.get(self.underlying)
+        self.fo_exchange        = FO_EXCHANGE.get(self.underlying, "nse_fo")
 
     # ─────────────────────────────────────────────────────────────────────────
     # Public interface
@@ -145,186 +170,204 @@ class OptionsStrategy:
 
     def generate_signal(self, data_manager, vix: float = None) -> Optional[TradeSignal]:
         """
-        Scan for an options entry opportunity.
-        Returns a TradeSignal (product=NRML, exchange=nse_fo) or None.
+        Dual-mode options signal generation.
+
+        Strong trend  (≥80%) → BUY directional CE/PE  → R:R 3.3:1
+        Moderate trend (65–79%) → SELL 1-OTM CE/PE   → theta decay, win% ~73%
+        Weak (<65%)            → no trade
 
         Args:
-            vix: Current India VIX value. If > 20 (elevated vol), options entry is blocked
-                 per SOP — high VIX means gamma risk is unacceptably elevated.
+            vix: India VIX. BUY mode: blocked if VIX > 25 (extreme vol).
+                            SELL mode: blocked if VIX > 20 (gamma risk).
         """
-        # SOP: Block new short options when VIX is elevated (>20)
-        # Theta income requires a stable vol environment; spikes indicate gap risk
-        if vix is not None and vix > 20:
-            logger.info(
-                f"Options [{self.underlying}]: VIX={vix:.1f} > 20 — "
-                f"skipping (elevated vol, gamma risk unacceptable)"
-            )
-            return None
+        from datetime import datetime as _dt, date as _date
 
-        # Step 1: Get OHLCV for trend detection.
-        # Prefer ETF proxy; fall back to index symbol if no ETF available (FINNIFTY, MIDCPNIFTY).
-        ohlcv_symbol  = self.etf_symbol or self.underlying
+        # ── Step 1: Trend detection ───────────────────────────────────────────
+        ohlcv_symbol   = self.etf_symbol or self.underlying
         ohlcv_exchange = "nse_cm"
-
         df = data_manager.get_ohlcv(ohlcv_symbol, ohlcv_exchange, limit=60)
         if len(df) < 25:
-            logger.debug(f"Options: not enough OHLCV data for {ohlcv_symbol}")
+            logger.debug(f"Options: not enough OHLCV for {ohlcv_symbol}")
             return None
 
-        trend, strength, _etf_price = self._detect_trend(df)
+        trend, strength, _ = self._detect_trend(df)
         if trend == "neutral" or strength < self.min_trend_strength:
-            logger.debug(f"Options: no clear trend (trend={trend} strength={strength:.0%})")
+            logger.debug(f"Options [{self.underlying}]: neutral/weak trend ({strength:.0%}) — skip")
             return None
 
-        # Step 2: Find nearest valid expiry
+        # ── Step 2: Determine mode ────────────────────────────────────────────
+        if strength >= BUY_STRENGTH_THRESHOLD:
+            mode = "BUY"
+        elif SELL_STRENGTH_MIN <= strength <= SELL_STRENGTH_MAX:
+            mode = "SELL"
+        else:
+            logger.debug(f"Options [{self.underlying}]: strength {strength:.0%} outside both modes — skip")
+            return None
+
+        # VIX gate per mode
+        if vix is not None:
+            if mode == "SELL" and vix > 20:
+                logger.info(f"Options [{self.underlying}]: SELL mode blocked — VIX={vix:.1f} > 20")
+                return None
+            if mode == "BUY" and vix > 25:
+                logger.info(f"Options [{self.underlying}]: BUY mode blocked — VIX={vix:.1f} > 25 (extreme)")
+                return None
+
+        # ── Step 3: Daily cap — max 1 signal per underlying per day ──────────
+        today = _date.today()
+        dl_entry = OptionsStrategy._daily_trades_per_ul.get(self.underlying)
+        if dl_entry and dl_entry[0] == today and dl_entry[1] >= UNDERLYING_DAILY_CAP:
+            logger.debug(f"Options [{self.underlying}]: daily cap reached ({UNDERLYING_DAILY_CAP}/day) — skip")
+            return None
+
+        # ── Step 4: Expiry ────────────────────────────────────────────────────
         expiry = self._nearest_valid_expiry()
         if expiry is None:
             return None
+        days_left = (expiry - today).days
 
-        # Step 3: Get actual index level for ATM strike calculation.
-        # Tier 1: direct index quote (works for BANKNIFTY, may fail for NIFTY/SENSEX).
-        # Tier 2: near-month futures quote (accurate to < 0.5%, always liquid).
-        # Tier 3: ETF × 100 from last OHLCV bar (last resort, ±1% error acceptable for ATM ±step).
+        # For SELL mode: prefer options with 4–21 DTE (theta burns fastest here)
+        # For BUY mode: prefer 7–30 DTE (enough time for move to play out)
+        if mode == "SELL" and days_left < 3:
+            logger.info(f"Options [{self.underlying}]: SELL mode — only {days_left}d to expiry, gamma risk too high")
+            return None
+        if mode == "BUY" and days_left < 2:
+            logger.info(f"Options [{self.underlying}]: BUY mode — only {days_left}d to expiry, skip")
+            return None
+
+        # ── Step 5: Index level for ATM strike ───────────────────────────────
         idx_sym, idx_exc = INDEX_QUOTE.get(self.underlying, (self.etf_symbol, "nse_cm"))
         idx_quote = data_manager.get_live_quote(idx_sym, idx_exc)
         if idx_quote and idx_quote.get("ltp", 0) > 0:
             index_price = idx_quote["ltp"]
-            logger.debug(f"Options: {self.underlying} index level from direct quote: {index_price:.0f}")
         else:
-            # Tier 2: near-month futures — futures price ≈ spot + small carry (<0.5%)
-            # For ATM strike rounded to step, carry difference of 130pts (0.5% on 26000) is < 3 strikes.
             futures_symbols = {
                 "NIFTY":     "NIFTY26JUNFUT",
                 "BANKNIFTY": "BANKNIFTY26JUNFUT",
                 "SENSEX":    "SENSEX26JUNFUT",
             }
-            fut_sym = futures_symbols.get(self.underlying)
+            fut_sym   = futures_symbols.get(self.underlying)
             fut_quote = data_manager.get_live_quote(fut_sym, self.fo_exchange) if fut_sym else None
             if fut_quote and fut_quote.get("ltp", 0) > 0:
                 index_price = fut_quote["ltp"]
-                logger.info(f"Options: {self.underlying} index level from futures {fut_sym}: {index_price:.0f}")
+                logger.info(f"Options: {self.underlying} level from futures: {index_price:.0f}")
+            elif self.etf_symbol and len(df) > 0:
+                index_price = float(df["close"].iloc[-1]) * 100
+                logger.warning(f"Options: {self.underlying} using ETF×100 fallback: {index_price:.0f}")
             else:
-                # Tier 3: ETF last close × 100 — least accurate but better than skipping entirely.
-                # NIFTYBEES × 100 ≈ NIFTY ±1%. At step=50, max strike error = 2 strikes (acceptable for ATM).
-                if self.etf_symbol and len(df) > 0:
-                    etf_close = float(df["close"].iloc[-1])
-                    index_price = etf_close * 100
-                    logger.warning(
-                        f"Options: {self.underlying} using ETF fallback "
-                        f"({self.etf_symbol} ₹{etf_close:.2f} × 100 = {index_price:.0f})"
-                    )
-                else:
-                    logger.warning(f"Options: {self.underlying} index level unavailable — all 3 tiers failed")
-                    return None
+                logger.warning(f"Options: {self.underlying} index level unavailable")
+                return None
 
-        step = STRIKE_STEP.get(self.underlying, 50)
+        step       = STRIKE_STEP.get(self.underlying, 50)
         atm_strike = round(index_price / step) * step
-        strike     = atm_strike + (self.strike_offset * step)
-        current_price = index_price  # used in reasoning string below
 
-        # SELL mode: sell the OPPOSITE option type to collect premium
-        # Bearish → SELL CE (call writers profit when market falls/stays flat)
-        # Bullish → SELL PE (put writers profit when market rises/stays flat)
-        option_type = "PE" if trend == "bullish" else "CE"
+        # ── Step 6: Strike selection by mode ─────────────────────────────────
+        if mode == "BUY":
+            # BUY: use ATM strike for maximum delta (≈0.50), clear directional exposure
+            # CE for bullish, PE for bearish
+            option_type  = "CE" if trend == "bullish" else "PE"
+            strike       = atm_strike
+            action       = "BUY"
+        else:  # SELL
+            # SELL: use 1-step OTM from ATM for delta ~0.25, probability of profit ~73%
+            # SELL CE when bearish (market stays flat/falls → CE decays to zero)
+            # SELL PE when bullish (market stays flat/rises → PE decays to zero)
+            option_type  = "CE" if trend == "bearish" else "PE"
+            # OTM direction: CE goes up from ATM, PE goes down from ATM
+            strike       = atm_strike + step if option_type == "CE" else atm_strike - step
+            action       = "SELL"
 
-        # Step 4: Find the option in scrip master
-        option_symbol = self._find_option_symbol(
-            data_manager, expiry, strike, option_type
-        )
+        # ── Step 7: Find option in scrip master ──────────────────────────────
+        option_symbol = self._find_option_symbol(data_manager, expiry, strike, option_type)
         if not option_symbol:
             logger.warning(
-                f"Options: {self.underlying}{expiry.strftime('%y%b').upper()}"
-                f"{strike}{option_type} not found in scrip master"
+                f"Options: {self.underlying} {expiry.strftime('%y%b').upper()}"
+                f" {strike}{option_type} not in scrip master"
             )
             return None
 
-        # Step 5: Get live quote for the option
+        # ── Step 8: Live quote + premium checks ──────────────────────────────
         quote = data_manager.get_live_quote(option_symbol, self.fo_exchange)
         if not quote or quote["ltp"] <= 0:
             logger.debug(f"Options: no live quote for {option_symbol}")
             return None
 
-        premium = quote["ltp"]
+        premium  = quote["ltp"]
         max_prem = MAX_PREMIUM_PER_UNDERLYING.get(self.underlying, MAX_PREMIUM)
-        if premium < MIN_PREMIUM:
-            logger.info(
-                f"Options: {option_symbol} premium ₹{premium:.2f} below"
-                f" ₹{MIN_PREMIUM} — deep OTM, skipping"
-            )
-            return None
-        if premium > max_prem:
-            logger.info(
-                f"Options: {option_symbol} premium ₹{premium:.2f} above"
-                f" ₹{max_prem} ({self.underlying} cap) — skipping"
-            )
-            return None
         lot_cost = premium * self.lot_size
 
+        if premium < MIN_PREMIUM:
+            logger.info(f"Options: {option_symbol} ₹{premium:.2f} < min ₹{MIN_PREMIUM} — deep OTM, skip")
+            return None
+        if premium > max_prem:
+            logger.info(f"Options: {option_symbol} ₹{premium:.2f} > max ₹{max_prem} — skip")
+            return None
         if lot_cost > MAX_PREMIUM_PER_LOT:
-            logger.info(
-                f"Options: {option_symbol} lot cost ₹{lot_cost:,.0f} exceeds"
-                f" max ₹{MAX_PREMIUM_PER_LOT:,.0f}"
-            )
+            logger.info(f"Options: lot cost ₹{lot_cost:,.0f} > max ₹{MAX_PREMIUM_PER_LOT:,.0f} — skip")
             return None
 
-        # Step 6: SL/target for SELL (short option) position
-        # We receive premium upfront. Exit by buying back:
-        #   Stop loss : premium rises to 2× received → buy back at 2× cost → loss = premium received
-        #   Target    : premium falls to 30% of received → buy back cheap → keep 70% of credit
-        stop_loss = round(premium * (1 + STOP_LOSS_PCT), 2)   # rises 100% → stop out
-        target    = round(premium * (1 - TARGET_PCT),    2)   # falls 70% → take profit
-        days_left = (expiry - date.today()).days
+        # ── Step 9: Symbol-level 10-min dedup ────────────────────────────────
+        last_sig = OptionsStrategy._last_signal_time.get(option_symbol)
+        if last_sig and (_dt.now() - last_sig).total_seconds() < SIGNAL_COOLDOWN_SECONDS:
+            logger.debug(f"Options: 10-min cooldown active for {option_symbol}")
+            return None
 
-        confidence = min(strength + 0.05, 0.90)  # slight boost for options setup
+        # ── Step 10: SL / target by mode ─────────────────────────────────────
+        if mode == "BUY":
+            # Pay premium. Exit when premium doubles (100% gain) or drops 30%.
+            target    = round(premium * (1 + BUY_TARGET_PCT), 2)   # ×2.0
+            stop_loss = round(premium * (1 - BUY_STOP_PCT),   2)   # ×0.70
+            rr_str    = "3.3:1"
+            mode_note = (
+                f"BUY {option_type} — strong directional play. "
+                f"Target ₹{target:.2f} (+100%). Stop ₹{stop_loss:.2f} (−30%). R:R {rr_str}."
+            )
+        else:  # SELL
+            # Receive premium. Buy back cheap when decayed 70%, or stop if it doubles.
+            stop_loss = round(premium * (1 + SELL_STOP_PCT),   2)   # ×2.0 (buy back at loss)
+            target    = round(premium * (1 - SELL_TARGET_PCT), 2)   # ×0.30 (buy back at profit)
+            # Approximate delta for 1-OTM (theoretical, no IV surface available)
+            approx_delta = 0.28
+            prob_profit  = round((1 - approx_delta) * 100)
+            rr_str       = "0.7:1"
+            mode_note = (
+                f"SELL {option_type} theta decay — 1-OTM strike, delta≈{approx_delta}, "
+                f"probability of profit≈{prob_profit}%. "
+                f"Keep 70% of credit if held to target. Stop if premium doubles. "
+                f"R:R {rr_str} — compensated by high win rate (~{prob_profit}%)."
+            )
+
+        confidence = min(strength + 0.05, 0.92)
         reasoning  = (
-            f"Options {option_type} on {self.underlying}. "
+            f"Options [{mode} mode] {option_type} on {self.underlying}. "
             f"Trend={trend} (strength={strength:.0%}). "
-            f"Strike={strike}. Expiry={expiry} ({days_left}d). "
-            f"Premium=₹{premium:.2f}/unit. Lot cost=₹{lot_cost:,.0f}."
+            f"Index≈{index_price:.0f}. Strike={strike} ({'ATM' if strike==atm_strike else '1-OTM'}). "
+            f"Expiry={expiry} ({days_left}d). "
+            f"Premium=₹{premium:.2f}/unit. LotCost=₹{lot_cost:,.0f}. "
+            + mode_note
         )
 
-        from datetime import datetime as _datetime
-
-        # Underlying-level 30-min cooldown — one signal per underlying per 30 min
-        # Prevents NIFTY CE at 09:30 and NIFTY PE at 09:35 both firing in quick succession
-        last_ul = OptionsStrategy._last_underlying_time.get(self.underlying)
-        if last_ul is not None:
-            elapsed_ul = (_datetime.now() - last_ul).total_seconds()
-            if elapsed_ul < UNDERLYING_COOLDOWN_SECONDS:
-                logger.debug(
-                    f"Options underlying cooldown for {self.underlying} "
-                    f"({elapsed_ul:.0f}s < {UNDERLYING_COOLDOWN_SECONDS}s) — skipping"
-                )
-                return None
-
-        # Per-symbol 10-min cooldown — suppress duplicate signal on same option contract
-        last_sig = OptionsStrategy._last_signal_time.get(option_symbol)
-        if last_sig is not None:
-            elapsed = (_datetime.now() - last_sig).total_seconds()
-            if elapsed < SIGNAL_COOLDOWN_SECONDS:
-                logger.debug(
-                    f"Options signal cooldown active for {option_symbol} "
-                    f"({elapsed:.0f}s < {SIGNAL_COOLDOWN_SECONDS}s) — skipping"
-                )
-                return None
-
-        OptionsStrategy._last_underlying_time[self.underlying] = _datetime.now()
-        OptionsStrategy._last_signal_time[option_symbol]       = _datetime.now()
+        # ── Commit cooldown + daily cap ───────────────────────────────────────
+        OptionsStrategy._last_signal_time[option_symbol] = _dt.now()
+        if dl_entry and dl_entry[0] == today:
+            OptionsStrategy._daily_trades_per_ul[self.underlying] = (today, dl_entry[1] + 1)
+        else:
+            OptionsStrategy._daily_trades_per_ul[self.underlying] = (today, 1)
 
         logger.info(
-            f"Options signal: SELL {option_symbol} @ ₹{premium:.2f}"
-            f" credit=₹{lot_cost:,.0f} conf={confidence:.0%}"
+            f"Options signal: {action} {option_symbol} @ ₹{premium:.2f} "
+            f"[{mode} mode] conf={confidence:.0%}"
         )
 
         return TradeSignal(
             symbol    = option_symbol,
             exchange  = self.fo_exchange,
-            action    = "SELL",
+            action    = action,
             price     = premium,
             strategy  = "options",
             confidence= confidence,
-            stop_loss = stop_loss,   # premium level to buy back at loss
-            target    = target,      # premium level to buy back at profit
+            stop_loss = stop_loss,
+            target    = target,
             quantity  = self.lot_size,
             product   = "NRML",
             reasoning = reasoning,

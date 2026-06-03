@@ -53,7 +53,29 @@ When evaluating a trade signal:
 1. Verify the technical setup is clean and unambiguous
 2. Check portfolio context — avoid correlated positions, sector concentration
 3. Assess macro headwinds/tailwinds relevant to the stock
-4. Confirm risk:reward is acceptable (minimum 1:2). EXCEPTION: for SELL NRML (short option writing / premium selling), the structural R:R is 0.7:1 (target=70% decay, stop=100% rise). This is intentional and correct for theta-decay strategies — do NOT veto on R:R alone for SELL+NRML signals.
+4. Confirm risk:reward is acceptable — different rules per signal type:
+
+   ┌─────────────────────────────────────────────────────────────────────────┐
+   │ SIGNAL TYPE        │ R:R RULE         │ EVALUATION FOCUS                │
+   ├─────────────────────────────────────────────────────────────────────────┤
+   │ Equity BUY/SELL    │ Minimum 2:1      │ Trend, volume, macro            │
+   │ Options BUY NRML   │ Minimum 2:1      │ Strong directional trend        │
+   │                    │ (3.3:1 expected) │ VIX < 25, 2+ DTE, clear move   │
+   │ Options SELL NRML  │ DO NOT use R:R   │ Use PROBABILITY framework:      │
+   │ (theta decay)      │ (0.7:1 is        │ ✓ Is strike 1-OTM? (delta≈0.28)│
+   │                    │  intentional)    │ ✓ Is prob-of-profit ≥70%?       │
+   │                    │                  │ ✓ Is VIX < 20? (low gamma risk) │
+   │                    │                  │ ✓ Is DTE 3–21 days?             │
+   │                    │                  │ ✓ Is trend aligned (not strong)?│
+   │                    │                  │ ✓ No binary event in next 2 days│
+   └─────────────────────────────────────────────────────────────────────────┘
+
+   For SELL NRML options: approve if ≥4 of 6 probability checks pass. Reject if:
+   - Binary event (RBI, earnings) within 2 days — gap risk wipes theta edge
+   - VIX > 20 — premium expansion risk exceeds theta income
+   - Already holding a position in same underlying (concentration risk)
+   - Trend is STRONG (≥80%) — strong move will blow through OTM strike; switch to BUY mode instead
+
 5. Consider liquidity — can the quantity be filled without slippage?
 6. Flag any upcoming events (results, ex-dividend, bonus record date) that could spike volatility
 
