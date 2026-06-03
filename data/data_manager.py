@@ -19,10 +19,65 @@ logger = logging.getLogger(__name__)
 
 DB_PATH = Path(__file__).parent.parent / "data" / "market_data.db"
 
-# Process-wide lock — serialises all DB writes within this process.
-# Prevents "database table is locked" when WebSocket tick thread and
-# main scheduler thread both try to write simultaneously.
-_DB_WRITE_LOCK = threading.Lock()
+# ── Singleton write connection ────────────────────────────────────────────────
+# SQLite's "database table is locked" occurs when two threads within the same
+# process each open their OWN connection and one writes while the other holds a
+# read cursor open on the same table.  WAL mode solves cross-process conflicts
+# but NOT cross-thread same-process conflicts.
+#
+# The permanent fix: a single persistent write connection, serialised by
+# threading.RLock so only one thread executes a write at any moment.
+# Reads continue to use _get_conn() (separate connections per call; WAL allows
+# concurrent reads alongside the one writer).
+
+class _SingletonWriteConn:
+    """Thread-safe singleton SQLite connection for all DB writes."""
+
+    def __init__(self):
+        self._lock = threading.RLock()   # reentrant — safe if same thread re-enters
+        self._conn: Optional[sqlite3.Connection] = None
+
+    def _open(self):
+        if self._conn is None:
+            self._conn = sqlite3.connect(
+                str(DB_PATH),
+                check_same_thread=False,
+                timeout=60.0,
+            )
+            self._conn.execute("PRAGMA journal_mode=WAL")
+            self._conn.execute("PRAGMA synchronous=NORMAL")
+            self._conn.execute("PRAGMA busy_timeout=60000")   # 60 s
+            self._conn.execute("PRAGMA cache_size=-32000")    # 32 MB page cache
+            self._conn.execute("PRAGMA temp_store=MEMORY")
+
+    def __enter__(self) -> sqlite3.Connection:
+        self._lock.acquire()
+        try:
+            self._open()
+            return self._conn
+        except Exception:
+            self._lock.release()
+            raise
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        try:
+            if exc_type is None:
+                self._conn.commit()
+            else:
+                try:
+                    self._conn.rollback()
+                except Exception:
+                    pass
+        finally:
+            self._lock.release()
+        return False   # don't suppress exceptions
+
+
+_WRITE_CONN = _SingletonWriteConn()
+
+# Keep backward-compat alias so any external code that imported
+# _DB_WRITE_LOCK directly still compiles without NameError.
+_DB_WRITE_LOCK = _WRITE_CONN._lock
 
 
 class DataManager:
@@ -252,9 +307,8 @@ class DataManager:
                 return False
 
             # Clear stale scrip master before fresh download
-            with self._get_conn() as conn:
+            with _WRITE_CONN as conn:
                 conn.execute("DELETE FROM scrip_master")
-                conn.commit()
             logger.info("Cleared old scrip master. Downloading fresh data...")
 
             total_inserted = 0
@@ -306,7 +360,7 @@ class DataManager:
                                  "series", "isin", "lot_size", "tick_size", "last_updated"]
                     df = df[[c for c in keep_cols if c in df.columns]]
 
-                    with self._get_conn() as conn:
+                    with _WRITE_CONN as conn:
                         df.to_sql("scrip_master", conn, if_exists="append",
                                   index=False)
                     total_inserted += len(df)
@@ -441,15 +495,13 @@ class DataManager:
         max_retries = 5
         for attempt in range(max_retries):
             try:
-                with _DB_WRITE_LOCK:   # serialise within this process
-                    with self._get_conn() as conn:
-                        conn.execute(
-                            """INSERT INTO tick_data (symbol, exchange, timestamp, ltp, volume, bid, ask)
-                               VALUES (?, ?, ?, ?, ?, ?, ?)""",
-                            (quote["symbol"], quote["exchange"], quote["timestamp"],
-                             quote["ltp"], quote["volume"], quote["bid"], quote["ask"])
-                        )
-                        conn.commit()
+                with _WRITE_CONN as conn:   # singleton write connection — no lock contention
+                    conn.execute(
+                        """INSERT INTO tick_data (symbol, exchange, timestamp, ltp, volume, bid, ask)
+                           VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                        (quote["symbol"], quote["exchange"], quote["timestamp"],
+                         quote["ltp"], quote["volume"], quote["bid"], quote["ask"])
+                    )
                 return
             except sqlite3.IntegrityError as e:
                 logger.debug(f"Duplicate tick ignored: {e}")
@@ -474,7 +526,7 @@ class DataManager:
     def store_candle(self, symbol: str, exchange: str, timestamp: str,
                      o: float, h: float, l: float, c: float, v: int):
         """Store a single OHLCV candle."""
-        with self._get_conn() as conn:
+        with _WRITE_CONN as conn:
             conn.execute(
                 """INSERT OR REPLACE INTO ohlcv
                    (symbol, exchange, timestamp, open, high, low, close, volume)
@@ -590,7 +642,7 @@ class DataManager:
         ohlcv["volume"] = df["volume"].resample(rule).sum()
         ohlcv = ohlcv.dropna()
 
-        with self._get_conn() as conn:
+        with _WRITE_CONN as conn:
             for ts, row in ohlcv.iterrows():
                 conn.execute(
                     """INSERT OR REPLACE INTO ohlcv
@@ -676,7 +728,7 @@ class DataManager:
                 exchange = instrument["exchange"] if instrument else "nse_cm"
 
                 inserted = 0
-                with self._get_conn() as conn:
+                with _WRITE_CONN as conn:
                     for ts, row in df.iterrows():
                         try:
                             conn.execute(
@@ -693,7 +745,6 @@ class DataManager:
                             inserted += 1
                         except Exception:
                             pass
-                    conn.commit()
 
                 logger.info(f"Bootstrapped {inserted} candles for {symbol} from yfinance")
                 total += inserted
@@ -746,7 +797,7 @@ class DataManager:
                     df.columns = [col[0] for col in df.columns]
 
                 inserted = 0
-                with self._get_conn() as conn:
+                with _WRITE_CONN as conn:
                     for ts, row in df.iterrows():
                         date_str = str(ts.date()) if hasattr(ts, "date") else str(ts)[:10]
                         try:
@@ -766,7 +817,6 @@ class DataManager:
                             inserted += 1
                         except Exception:
                             pass
-                    conn.commit()
 
                 total += inserted
                 logger.info(f"Daily OHLCV {symbol}: {inserted} days inserted ({period})")
@@ -790,7 +840,7 @@ class DataManager:
             if missing:
                 raise ValueError(f"Missing required trade fields: {missing}")
 
-            with _DB_WRITE_LOCK, self._get_conn() as conn:
+            with _WRITE_CONN as conn:
                 conn.execute(
                     """INSERT INTO trades
                        (symbol, exchange, action, strategy, entry_price, exit_price,
@@ -811,7 +861,6 @@ class DataManager:
                         str(trade.get("order_no", "")),
                     ),
                 )
-                conn.commit()
         except ValueError as e:
             logger.error(f"Trade validation error: {e}")
             raise
@@ -852,7 +901,7 @@ class DataManager:
         """
         import json
         regime_data = regime_data or {}
-        with _DB_WRITE_LOCK, self._get_conn() as conn:
+        with _WRITE_CONN as conn:
             conn.execute(
                 """UPDATE bot_status SET
                    daily_pnl=?, daily_trades=?, open_positions=?,
@@ -908,7 +957,7 @@ class DataManager:
     def log_event(self, event_type: str, message: str, symbol: str = "", metadata: dict = None):
         """Log an event (signal, veto, execution, etc.) for dashboard feed."""
         import json
-        with _DB_WRITE_LOCK, self._get_conn() as conn:
+        with _WRITE_CONN as conn:
             conn.execute(
                 """INSERT INTO events (timestamp, event_type, message, symbol, metadata)
                    VALUES (?, ?, ?, ?, ?)""",
@@ -954,7 +1003,7 @@ class DataManager:
             signal_price, stop_loss, target, market_regime
         """
         import json
-        with self._get_conn() as conn:
+        with _WRITE_CONN as conn:
             cur = conn.execute(
                 """INSERT INTO ai_decisions
                    (decided_at, symbol, strategy, action,
@@ -991,7 +1040,7 @@ class DataManager:
         outcome: "win" | "loss" | "breakeven"
         good_decision: True if approved+win OR vetoed+would-have-lost
         """
-        with self._get_conn() as conn:
+        with _WRITE_CONN as conn:
             conn.execute(
                 """UPDATE ai_decisions
                    SET outcome=?, outcome_pnl=?, outcome_correct=?, good_decision=?,
@@ -1001,7 +1050,6 @@ class DataManager:
                  1 if good_decision else 0, outcome, str(datetime.now()),
                  decision_id),
             )
-            conn.commit()
 
     def get_ai_decisions(self, limit: int = 200, symbol: str = None,
                          approved_only: bool = False) -> pd.DataFrame:
@@ -1032,7 +1080,7 @@ class DataManager:
                     trades_opened, trades_closed, day_pnl, cumulative_pnl,
                     win_count, loss_count, open_positions, notes
         """
-        with self._get_conn() as conn:
+        with _WRITE_CONN as conn:
             conn.execute(
                 """INSERT INTO daily_journal
                    (date, market_regime, signals_seen, signals_approved,
@@ -1157,7 +1205,7 @@ class DataManager:
         - events:     keep last `events_days` days (default 30) — dashboard shows last 50 rows
         Called daily during job_daily_setup.
         """
-        with self._get_conn() as conn:
+        with _WRITE_CONN as conn:
             tick_deleted = conn.execute(
                 "DELETE FROM tick_data WHERE timestamp < datetime('now', ? || ' days')",
                 (f"-{tick_days}",)
