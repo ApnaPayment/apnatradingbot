@@ -30,6 +30,10 @@ class DataManager:
     def __init__(self, kotak_client=None):
         self.client = kotak_client
         DB_PATH.parent.mkdir(exist_ok=True)
+        # Tracks last known cumulative day-volume per symbol for delta calculation.
+        # Kotak REST returns last_volume = cumulative, not per-bar; we subtract previous
+        # cumulative to compute per-bar volume. Keyed by symbol string.
+        self._vol_prev_cumulative: dict = {}
 
         # Enable WAL mode for better concurrency and configure timeouts
         try:
@@ -467,6 +471,11 @@ class DataManager:
         Fetch live REST quote for each symbol and save as the current 5-min candle.
         Aligns timestamp to the current 5-minute bar (e.g. 09:25:00 for any time 09:25–09:29).
         Called every cycle when WebSocket ticks are unavailable.
+
+        Volume fix: Kotak `last_volume` is the cumulative day-volume counter, not
+        per-bar volume.  We subtract the previous bar's cumulative volume to get the
+        delta (shares traded in this 5-min bar).  On the first bar of the day the
+        previous value is 0, so the first bar correctly shows the opening auction volume.
         """
         from datetime import datetime as _dt
         now = _dt.now()
@@ -487,10 +496,24 @@ class DataManager:
                 h = q.get("high") or ltp
                 l = q.get("low")  or ltp
                 c = ltp
-                v = q.get("volume") or 0
+                cumulative_vol = int(q.get("volume") or 0)
+
+                # ── Volume delta: convert cumulative day-vol to per-bar vol ────────
+                # Kotak REST returns last_volume = cumulative day volume.
+                # yfinance stores per-bar volume.  Mixing them makes vol_ratio wrong.
+                # We track the last stored cumulative volume per symbol and subtract.
+                prev_cumulative = self._vol_prev_cumulative.get(symbol, 0)
+                bar_volume = max(0, cumulative_vol - prev_cumulative)
+                # Update tracker; reset to 0 if cumulative drops (new day / data gap)
+                if cumulative_vol >= prev_cumulative:
+                    self._vol_prev_cumulative[symbol] = cumulative_vol
+                else:
+                    self._vol_prev_cumulative[symbol] = cumulative_vol
+                    bar_volume = cumulative_vol  # first bar of day — use as-is
+
                 # Only store if we have meaningful OHLC (open > 0)
                 if o > 0:
-                    self.store_candle(symbol, exchange, bar_ts, o, h, l, c, v)
+                    self.store_candle(symbol, exchange, bar_ts, o, h, l, c, bar_volume)
                     saved += 1
             except Exception as e:
                 logger.debug(f"Quote-to-candle failed for {symbol}: {e}")
@@ -576,16 +599,17 @@ class DataManager:
             logger.error("yfinance not installed. Run: pip install yfinance")
             return 0
 
-        # Check if we already have today's candles — skip download if fresh enough
+        # Check if we already have today's candles — skip download only if ALL symbols are fresh
         from datetime import date as _date
         today_str = str(_date.today())
+        placeholders = ",".join("?" * len(symbols))
         with self._get_conn() as conn:
             fresh_count = conn.execute(
-                "SELECT COUNT(DISTINCT symbol) FROM ohlcv WHERE timestamp >= ?",
-                (today_str,)
+                f"SELECT COUNT(DISTINCT symbol) FROM ohlcv WHERE timestamp >= ? AND symbol IN ({placeholders})",
+                [today_str] + list(symbols)
             ).fetchone()[0]
-        if fresh_count >= len(symbols) * 0.8:   # 80% of symbols have today's data
-            logger.info(f"Bootstrap skipped — {fresh_count}/{len(symbols)} symbols already have today's candles")
+        if fresh_count >= len(symbols):   # ALL symbols have today's data — truly fresh
+            logger.info(f"Bootstrap skipped — all {fresh_count}/{len(symbols)} symbols have today's candles")
             with self._get_conn() as conn:
                 return conn.execute("SELECT COUNT(*) FROM ohlcv").fetchone()[0]
 
@@ -825,12 +849,16 @@ class DataManager:
                     portfolio.get("daily_trades", 0),
                     json.dumps({
                         k: {
-                            "action": v["action"],
+                            "action":      v["action"],
                             "entry_price": v["entry_price"],
-                            "quantity": v["quantity"],
-                            "stop_loss": v["stop_loss"],
-                            "target": v["target"],
-                            "strategy": v.get("strategy", ""),
+                            "quantity":    v["quantity"],
+                            "stop_loss":   v["stop_loss"],
+                            "target":      v["target"],
+                            "strategy":    v.get("strategy", ""),
+                            "exchange":    v.get("exchange", "nse_cm"),
+                            "product":     v.get("product", "CNC"),
+                            "entry_time":  v.get("entry_time", ""),
+                            "order_no":    v.get("order_no", ""),
                         }
                         for k, v in portfolio.get("open_positions", {}).items()
                     }),
@@ -1122,7 +1150,10 @@ class DataManager:
                 "DELETE FROM events WHERE timestamp < datetime('now', ? || ' days')",
                 (f"-{events_days}",)
             ).rowcount
-            conn.execute("PRAGMA wal_checkpoint(PASSIVE)")  # TRUNCATE needs exclusive lock; PASSIVE is safe with concurrent readers
+            try:
+                conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
+            except Exception as _wal_err:
+                logger.debug(f"WAL checkpoint skipped (concurrent reader active): {_wal_err}")
         logger.info(
             f"DB cleanup: removed {tick_deleted} old ticks, {events_deleted} old events"
         )

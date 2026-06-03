@@ -54,6 +54,73 @@ class RiskManager:
         self.daily_trades: int = 0
         self.today: date = date.today()
 
+    def restore_from_db(self, data_manager) -> None:
+        """
+        Restore open_positions and daily_pnl from the last saved bot_status row.
+        Must be called once during startup (after DataManager is ready) to prevent
+        position loss and daily-loss-limit bypass after a restart.
+
+        Only restores if the saved state is from TODAY — stale state from a prior
+        trading day is discarded (positions would be closed by broker EOD anyway,
+        and carrying yesterday's P&L into today's loss limit would be wrong).
+        """
+        try:
+            status = data_manager.get_bot_status()
+        except Exception as e:
+            logger.warning(f"restore_from_db: could not read bot_status: {e}")
+            return
+
+        if not status:
+            logger.info("restore_from_db: no saved state found — starting fresh")
+            return
+
+        # Only restore if the last save was today
+        last_cycle_str = status.get("last_cycle", "")
+        try:
+            from datetime import datetime as _dt
+            last_date = _dt.fromisoformat(last_cycle_str).date()
+        except Exception:
+            last_date = None
+
+        today = date.today()
+        if last_date != today:
+            logger.info(
+                f"restore_from_db: saved state is from {last_date} (today={today}) "
+                f"— not restoring stale positions"
+            )
+            return
+
+        # Restore daily P&L
+        saved_pnl = float(status.get("daily_pnl", 0) or 0)
+        if saved_pnl != 0:
+            self.daily_pnl = saved_pnl
+            logger.info(f"restore_from_db: daily_pnl restored to ₹{self.daily_pnl:,.2f}")
+
+        # Restore open positions — stored as a reduced dict, reconstruct full position dict
+        saved_positions = status.get("open_positions", {})
+        if isinstance(saved_positions, dict) and saved_positions:
+            # The stored dict has: action, entry_price, quantity, stop_loss, target, strategy
+            # Add defaults for fields not stored (exchange, product, order_no, entry_time)
+            for symbol, pos in saved_positions.items():
+                self.open_positions[symbol] = {
+                    "order_no":    pos.get("order_no", "RESTORED"),
+                    "symbol":      symbol,
+                    "exchange":    pos.get("exchange", "nse_cm"),
+                    "action":      pos.get("action", "BUY"),
+                    "entry_price": float(pos.get("entry_price", 0)),
+                    "quantity":    int(pos.get("quantity", 0)),
+                    "stop_loss":   float(pos.get("stop_loss", 0)),
+                    "target":      float(pos.get("target", 0)),
+                    "strategy":    pos.get("strategy", "unknown"),
+                    "product":     pos.get("product", "CNC"),
+                    "entry_time":  pos.get("entry_time", str(today)),
+                }
+            logger.warning(
+                f"restore_from_db: {len(self.open_positions)} open position(s) restored "
+                f"from last save — stop-loss monitoring ACTIVE: "
+                f"{list(self.open_positions.keys())}"
+            )
+
     # ─────────────────────────────────────────────────────────────────────────
     # Core approval gate
     # ─────────────────────────────────────────────────────────────────────────
@@ -168,10 +235,18 @@ class RiskManager:
         return True, ""
 
     def _check_capital(self, signal: TradeSignal, available_capital: float) -> tuple[bool, str]:
-        max_position = min(
-            available_capital,
-            self.config.max_capital * (self.config.max_position_size_pct / 100)
-        )
+        # Options (NRML): lot cost is fixed by exchange and cannot be reduced by position sizing.
+        # Capital check is still done but against 25% of max_capital (not 10%) to allow one lot.
+        if getattr(signal, "product", "CNC") == "NRML":
+            max_position = min(
+                available_capital,
+                self.config.max_capital * 0.25   # 25% cap for options = ₹25k on ₹1L capital
+            )
+        else:
+            max_position = min(
+                available_capital,
+                self.config.max_capital * (self.config.max_position_size_pct / 100)
+            )
         trade_value = signal.price * signal.quantity
         if trade_value > max_position:
             return False, f"Trade value ₹{trade_value:.0f} > max position ₹{max_position:.0f}"
@@ -261,17 +336,18 @@ class RiskManager:
     def record_entry(self, signal: TradeSignal, order_no: str):
         """Record a new position after successful order placement."""
         self.open_positions[signal.symbol] = {
-            "order_no":   order_no,
-            "symbol":     signal.symbol,
-            "exchange":   signal.exchange,
-            "action":     signal.action,
+            "order_no":    order_no,
+            "symbol":      signal.symbol,
+            "exchange":    signal.exchange,
+            "action":      signal.action,
             "entry_price": signal.price,
-            "quantity":   signal.quantity,
-            "stop_loss":  signal.stop_loss,
-            "target":     signal.target,
-            "strategy":   signal.strategy,
-            "product":    signal.product,
-            "entry_time": str(__import__("datetime").datetime.now()),
+            "quantity":    signal.quantity,
+            "stop_loss":   signal.stop_loss,
+            "target":      signal.target,
+            "strategy":    signal.strategy,
+            "product":     signal.product,
+            "entry_time":  str(__import__("datetime").datetime.now()),
+            "_decision_id": getattr(signal, "_decision_id", None),
         }
         self.daily_trades += 1
         logger.info(f"Position recorded: {signal.symbol} @ ₹{signal.price}")
@@ -339,8 +415,15 @@ class RiskManager:
         if not self.config.trailing_stop_enabled:
             return False
 
-        pct = trail_pct if trail_pct is not None else self.config.trailing_stop_pct
         pos = self.open_positions[symbol]
+        if trail_pct is not None:
+            pct = trail_pct
+        elif pos.get("product") == "NRML":
+            # Options positions need a much wider trail — 1.5% activates on bid-ask
+            # noise and locks in losses via slippage. Use 15% trail for NRML (options).
+            pct = 15.0
+        else:
+            pct = self.config.trailing_stop_pct
 
         if pos["action"] == "BUY":
             new_stop = round(current_price * (1 - pct / 100), 2)

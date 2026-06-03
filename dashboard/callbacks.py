@@ -381,7 +381,8 @@ def _render_settings_page():
         ("Scrip Instruments", f"{db_stats.get('scrip_instruments', 0):,}"),
         ("OHLCV Candles",     f"{db_stats.get('ohlcv_candles', 0):,}"),
         ("Tick Data",         f"{db_stats.get('ticks_stored', 0):,}"),
-        ("Trades Recorded",   str(db_stats.get('trades_recorded', 0))),
+        ("NSE Trades",        str(db_stats.get('trades_recorded', 0))),
+        ("LIQ Trades",        str(db_stats.get('liq_trades', 0))),
         ("Events Logged",     str(db_stats.get('events_logged', 0))),
     ]
     rows = []
@@ -527,17 +528,27 @@ def _build_trades_table(trades_df):
 # Main page routing callback
 # ─────────────────────────────────────────────────────────────────────────────
 
+from dash import ctx as _dash_ctx
+
+
 @callback(
     Output("page-content", "children"),
     Input("url", "pathname"),
     Input("interval-component", "n_intervals"),
 )
 def display_page(pathname, n_intervals):
+    # Charts page: only rebuild on navigation, NOT on 3s interval tick.
+    # The chart itself is refreshed by update_chart() when the dropdown changes.
+    # This prevents the dropdown from resetting to the default symbol on every refresh.
+    if pathname == "/charts" and _dash_ctx.triggered_id == "interval-component":
+        from dash.exceptions import PreventUpdate
+        raise PreventUpdate
     try:
         bot_status = db.get_bot_status()
         events_df  = db.get_events(limit=50)
         # Only fetch full trades table on pages that need it — not every 3s refresh
-        trades_df  = db.get_trades(limit=2000) if pathname in ("/trades", "/analytics") else db.get_trades(limit=20)
+        trades_df    = db.get_trades(limit=2000) if pathname in ("/trades", "/analytics") else db.get_trades(limit=20)
+        decisions_df = db.get_ai_decisions(limit=200)
     except Exception as e:
         logger.error(f"DB error in display_page: {e}")
         return html.Div(f"⚠ Database error: {str(e)[:120]}",
@@ -553,7 +564,7 @@ def display_page(pathname, n_intervals):
                 html.Div(children=[
                     html.Div(
                         dcc.Loading(type="default", color="#4dabf7",
-                                    children=[chart_component(ohlcv, trades_df, "NIFTYBEES-EQ")]),
+                                    children=[chart_component(ohlcv, trades_df, "NIFTYBEES-EQ", decisions_df)]),
                         style={"flex": "2", "min-width": "400px"},
                     ),
                     html.Div(
@@ -586,17 +597,19 @@ def display_page(pathname, n_intervals):
                         options=[{"label": s, "value": s} for s in symbols],
                         value=symbol,
                         clearable=False,
+                        persistence=True,
+                        persistence_type="session",
                         style={"width": "220px", "background-color": "#1e2a3a",
                                "color": "#111", "border": "1px solid #2a3547",
                                "border-radius": "4px"},
                     ),
                 ], style={"margin": "12px 16px", "display": "flex", "gap": "10px",
                            "align-items": "center"}),
-                dcc.Loading(
-                    id="loading-chart-main", type="default", color="#4dabf7",
-                    children=[html.Div(id="chart-container",
-                                       children=[chart_component(ohlcv, trades_df, symbol)])],
-                ),
+                # No dcc.Loading wrapper — avoids spinner flash on every auto-refresh
+                html.Div(id="chart-container",
+                         children=[chart_component(ohlcv, trades_df, symbol, decisions_df)]),
+                # Separate slow interval for chart-only refresh (60s — candles build every 5min)
+                dcc.Interval(id="chart-interval", interval=60_000, n_intervals=0),
             ], style={"padding-bottom": "20px"})
         except Exception as e:
             logger.error(f"Charts page error: {e}")
@@ -606,15 +619,70 @@ def display_page(pathname, n_intervals):
     # ── Trades ────────────────────────────────────────────────────────────────
     elif pathname == "/trades":
         try:
-            return html.Div(children=[
-                header_component(bot_status),
-                html.Div("Trade History", style=_SECTION_TITLE),
+            # NSE Bot trades
+            nse_section = html.Div([
+                html.H3("NSE Bot Trades", style={"color": "#4dabf7", "margin": "12px 0 8px 0", "fontSize": "16px"}),
                 _trades_filter_bar(trades_df),
                 dcc.Loading(
                     id="loading-trades-table", type="default", color="#4dabf7",
                     children=[html.Div(id="trades-table-content",
                                        children=_build_trades_table(trades_df))],
                 ),
+            ])
+
+            # Liquidity Engine trades (MCX + BSE paper)
+            liq_trades_df = db.get_liq_trades(limit=500)
+            liq_stats = db.get_liq_today_stats()
+            liq_status = db.get_liq_bot_status()
+
+            if not liq_trades_df.empty:
+                liq_display_cols = ["symbol", "exchange", "action", "strategy",
+                                    "entry_price", "exit_price", "quantity",
+                                    "pnl", "exit_reason", "entry_time"]
+                liq_display_cols = [c for c in liq_display_cols if c in liq_trades_df.columns]
+                liq_table = dash_table.DataTable(
+                    data=liq_trades_df[liq_display_cols].to_dict("records"),
+                    columns=[{"name": c.replace("_", " ").title(), "id": c} for c in liq_display_cols],
+                    sort_action="native",
+                    page_size=20,
+                    style_table={"overflowX": "auto"},
+                    style_header={"backgroundColor": "#1e2430", "color": "#4dabf7",
+                                  "fontWeight": "600", "border": "1px solid #2a3142"},
+                    style_cell={"backgroundColor": "#151a24", "color": "#e0e0e0",
+                                "border": "1px solid #2a3142", "padding": "6px 10px",
+                                "fontFamily": "Roboto Mono, monospace", "fontSize": "12px"},
+                    style_data_conditional=[
+                        {"if": {"filter_query": "{pnl} > 0"},
+                         "color": "#00ff88", "fontWeight": "600"},
+                        {"if": {"filter_query": "{pnl} < 0"},
+                         "color": "#ff4444"},
+                    ],
+                )
+            else:
+                liq_table = html.Div("No liquidity engine trades yet",
+                                     style={"color": "#888", "padding": "16px"})
+
+            segments = ", ".join(liq_status.get("segments_active", [])) or "—"
+            liq_section = html.Div([
+                html.H3("Liquidity Engine — MCX & BSE Paper Trades",
+                        style={"color": "#ffd700", "margin": "24px 0 8px 0", "fontSize": "16px"}),
+                html.Div([
+                    html.Span(f"Status: {liq_status.get('status', '—').upper()}  ",
+                              style={"color": "#00ff88" if liq_status.get("status") == "running" else "#888"}),
+                    html.Span(f"Segments: {segments}  ",
+                              style={"color": "#aaa", "marginLeft": "16px"}),
+                    html.Span(f"Today: {liq_stats['trades']} trades | P&L ₹{liq_stats['total_pnl']:+.2f} | "
+                              f"MCX: {liq_stats['mcx_trades']} | BSE: {liq_stats['bse_trades']}",
+                              style={"color": "#aaa", "marginLeft": "16px"}),
+                ], style={"marginBottom": "8px", "fontSize": "13px"}),
+                liq_table,
+            ])
+
+            return html.Div(children=[
+                header_component(bot_status),
+                html.Div("Trade History", style=_SECTION_TITLE),
+                nse_section,
+                liq_section,
             ], style={"padding-bottom": "20px"})
         except Exception as e:
             logger.error(f"Trades page error: {e}")
@@ -683,15 +751,17 @@ def display_page(pathname, n_intervals):
 @callback(
     Output("chart-container", "children"),
     Input("chart-symbol-selector", "value"),
+    Input("chart-interval", "n_intervals"),
     prevent_initial_call=True,
 )
-def update_chart(symbol):
+def update_chart(symbol, n_intervals):
     if not symbol:
         return []
     try:
-        trades_df = db.get_trades(limit=2000)
-        ohlcv = db.get_ohlcv(symbol, limit=200)
-        return chart_component(ohlcv, trades_df, symbol)
+        trades_df    = db.get_trades(limit=2000)
+        decisions_df = db.get_ai_decisions(limit=200)
+        ohlcv        = db.get_ohlcv(symbol, limit=200)
+        return chart_component(ohlcv, trades_df, symbol, decisions_df)
     except Exception as e:
         return html.Div(f"⚠ Chart error: {e}", style={"color": "#ff4444", "padding": "16px"})
 

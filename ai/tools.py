@@ -37,11 +37,11 @@ TOOL_SCHEMAS = [
             "properties": {
                 "symbol": {
                     "type": "string",
-                    "description": "NSE trading symbol e.g. 'RELIANCE-EQ', 'TCS-EQ', 'NIFTYBEES-EQ'"
+                    "description": "NSE trading symbol e.g. 'RELIANCE-EQ', 'TCS-EQ', 'NIFTY2660923300CE'"
                 },
                 "exchange": {
                     "type": "string",
-                    "description": "Exchange segment. Default: 'nse_cm'",
+                    "description": "Exchange segment. Auto-detected: CE/PE symbols use 'nse_fo', equity uses 'nse_cm'. Only pass this if you need to override.",
                     "default": "nse_cm"
                 }
             },
@@ -124,7 +124,13 @@ class ToolExecutor:
 
     # ── Tool implementations ──────────────────────────────────────────────────
 
-    def _get_live_quote(self, symbol: str, exchange: str = "nse_cm") -> dict:
+    def _get_live_quote(self, symbol: str, exchange: str = None) -> dict:
+        # Auto-detect exchange for options: CE/PE symbols are always on nse_fo
+        if exchange is None:
+            if symbol.endswith("CE") or symbol.endswith("PE"):
+                exchange = "nse_fo"
+            else:
+                exchange = "nse_cm"
         quote = self.data.get_live_quote(symbol, exchange)
         if not quote:
             return {"error": f"No live quote found for {symbol}"}

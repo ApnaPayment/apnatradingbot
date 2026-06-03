@@ -149,7 +149,7 @@ class AIDecisionEngine:
             return self._parse_evaluation(text, signal)
         except Exception as e:
             logger.error(f"AI evaluation failed: {e}")
-            return self._passthrough(signal)
+            return self._reject_on_failure(signal, str(e))
 
     def _evaluate_with_tools(self, prompt: str, signal: TradeSignal) -> dict:
         """
@@ -485,17 +485,42 @@ CORRELATION (pairs ≥0.65):
         else:
             portfolio_section = f"\nCURRENT PORTFOLIO:\n{json.dumps(basic, indent=2)}"
 
+        # Build trade-type-aware risk:reward display
+        _is_short_option = (
+            getattr(signal, "action", "BUY") == "SELL"
+            and getattr(signal, "product", "CNC") == "NRML"
+        )
+        if _is_short_option:
+            # Short option: profit = credit collected when premium DECAYS
+            # premium received = signal.price; target = buy back cheap; stop = buy back at 2×
+            _premium   = signal.price
+            _profit    = _premium - signal.target   # e.g. 176.40 - 52.92 = 123.48 (70% of premium)
+            _risk      = signal.stop_loss - _premium # e.g. 352.80 - 176.40 = 176.40 (100% of premium)
+            _rr_str    = (
+                f"Credit received: ₹{_premium:.2f}/unit. "
+                f"Max profit if premium decays to ₹{signal.target:.2f}: ₹{_profit:.2f}/unit ({_profit/_premium*100:.0f}% of credit). "
+                f"Max loss if premium rises to ₹{signal.stop_loss:.2f}: ₹{_risk:.2f}/unit ({_risk/_premium*100:.0f}% of credit). "
+                f"This is a PREMIUM SELLING strategy — profit comes from TIME DECAY (theta), not directional movement. "
+                f"Win rate is typically 60–70%+ for premium selling; a 2:1 R:R requirement does NOT apply. "
+                f"The position has a defined stop loss (not naked/unlimited risk)."
+            )
+        else:
+            _rr = abs(signal.target - signal.price) / max(abs(signal.price - signal.stop_loss), 0.01)
+            _rr_str = (
+                f"{_rr:.1f}:1 "
+                f"{'✓' if _rr >= 2 else '✗ below 2:1'}"
+            )
+
         return f"""You are evaluating a trade signal as a portfolio manager — not just a signal approver.
 Your job is to decide whether this trade FITS the current portfolio, not just whether the signal is technically valid.
 
 TRADE SIGNAL:
 - Symbol:     {signal.symbol}
-- Action:     {signal.action}
-- Entry:      ₹{signal.price}
-- Stop Loss:  ₹{signal.stop_loss}
-- Target:     ₹{signal.target}
-- Risk:Reward: {abs(signal.target - signal.price) / abs(signal.price - signal.stop_loss):.1f}:1 \
-{'✓' if abs(signal.target - signal.price) / max(abs(signal.price - signal.stop_loss), 0.01) >= 2 else '✗ below 2:1'}
+- Action:     {signal.action}  {'← OPTION WRITING (short option, collect premium upfront)' if _is_short_option else ''}
+- Entry:      ₹{signal.price}  {'(premium received/collected)' if _is_short_option else ''}
+- Stop Loss:  ₹{signal.stop_loss}  {'(buy back if premium RISES to this level — defined max loss, NOT naked/unlimited)' if _is_short_option else ''}
+- Target:     ₹{signal.target}  {'(buy back when premium FALLS to this level — profit from decay)' if _is_short_option else ''}
+- Risk/Reward: {_rr_str}
 - Strategy:   {signal.strategy}
 - Confidence: {signal.confidence:.0%}
 - Reasoning:  {signal.reasoning}
@@ -527,6 +552,7 @@ EVALUATION CHECKLIST (address each):
 5. Lose streak caution — if on a losing streak, apply extra scrutiny.
 6. ML prediction — if ML shows high-confidence caution, weight that appropriately.
 7. Calendar risk — expiry day/week and upcoming events often cause sharp reversals; adjust accordingly.
+{"8. Option writing specific: evaluate whether the underlying will stay BELOW (for CE) or ABOVE (for PE) the strike by expiry. The stop loss is defined — this is NOT a naked short. Do NOT require 2:1 R:R for short options." if _is_short_option else ""}
 
 Tools available: get_live_quote (verify price hasn't moved), get_recent_candles (verify trend if unclear).
 Only call a tool if that specific data is NOT already provided above. Portfolio/P&L/sector data is already in this prompt — do not call tools for it.
@@ -750,11 +776,34 @@ Rules:
         return result
 
     def _passthrough(self, signal: TradeSignal) -> dict:
+        """Only called when ANTHROPIC_API_KEY is not configured at all (self.client is None)."""
         return {
             "approved": True,
             "confidence_adjustment": 0.0,
             "reasoning": "AI not configured — passing signal through as-is",
             "suggested_stop_loss": signal.stop_loss,
             "suggested_target": signal.target,
-            "concerns": ["ANTHROPIC_API_KEY not set"],
+            "concerns": ["ANTHROPIC_API_KEY not set — configure key to enable AI veto"],
+        }
+
+    def _reject_on_failure(self, signal: TradeSignal, reason: str) -> dict:
+        """
+        Called when AI IS configured but the API call failed (529 overload, timeout, etc.).
+        Rejects the signal for safety — never auto-approve when the veto layer is down.
+        The signal will be retried naturally in the next 5-minute cycle.
+        """
+        logger.warning(
+            f"AI temporarily unavailable ({reason[:80]}) — "
+            f"REJECTING {signal.symbol} for safety. Will retry next cycle."
+        )
+        return {
+            "approved": False,
+            "confidence_adjustment": 0.0,
+            "reasoning": (
+                f"AI veto layer temporarily unavailable ({reason[:120]}). "
+                "Signal rejected for safety — will be re-evaluated next cycle."
+            ),
+            "suggested_stop_loss": signal.stop_loss,
+            "suggested_target": signal.target,
+            "concerns": [f"AI service error: {reason[:120]}"],
         }

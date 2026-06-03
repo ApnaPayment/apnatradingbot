@@ -3,11 +3,17 @@ Telegram Alert Bot
 Sends real-time trading alerts, P&L updates, and AI summaries.
 """
 
+import html
 import os
 import logging
 import requests
 from datetime import datetime
 from core.risk_manager import TradeSignal
+
+
+def _esc(text: str) -> str:
+    """Escape text for Telegram HTML parse mode."""
+    return html.escape(str(text))
 
 logger = logging.getLogger(__name__)
 
@@ -63,18 +69,18 @@ class TelegramAlerter:
                 rr = f"\n⚖️ R:R = 1:{reward/risk:.1f}"
 
         msg = (
-            f"{emoji} <b>{signal.action} SIGNAL — {signal.symbol}</b>\n"
+            f"{emoji} <b>{signal.action} SIGNAL — {_esc(signal.symbol)}</b>\n"
             f"{'─' * 28}\n"
             f"💰 Entry:     ₹{signal.price:,.2f}\n"
             f"🛑 Stop Loss: ₹{signal.stop_loss:,.2f}\n"
             f"🎯 Target:    ₹{signal.target:,.2f}\n"
-            f"📊 Strategy:  {signal.strategy.title()}\n"
+            f"📊 Strategy:  {_esc(signal.strategy.title())}\n"
             f"🔮 Confidence: {signal.confidence:.0%}\n"
             f"{rr}\n\n"
-            f"<i>{signal.reasoning[:200]}</i>"
+            f"<i>{_esc(signal.reasoning[:200])}</i>"
         )
         if ai_reasoning:
-            msg += f"\n\n🤖 <b>AI:</b> {ai_reasoning[:200]}"
+            msg += f"\n\n🤖 <b>AI:</b> {_esc(ai_reasoning[:200])}"
 
         self.send(msg)
 
@@ -96,16 +102,16 @@ class TelegramAlerter:
 
         # Build bullet points from concerns (max 4), or fall back to reasoning snippet
         if concerns:
-            bullets = "\n".join(f"  • {c}" for c in concerns[:4])
+            bullets = "\n".join(f"  • {_esc(c)}" for c in concerns[:4])
         else:
             # Chunk reasoning into short bullets
             sentences = [s.strip() for s in reasoning.replace(". ", ".|").split("|") if s.strip()]
-            bullets = "\n".join(f"  • {s}" for s in sentences[:3])
+            bullets = "\n".join(f"  • {_esc(s)}" for s in sentences[:3])
 
         tools_line = f"🔧 Verified via: {', '.join(tools_used)}\n" if tools_used else ""
 
         msg = (
-            f"🚫 <b>AI Veto — {signal.symbol.replace('-EQ', '')}</b>\n"
+            f"🚫 <b>AI Veto — {_esc(signal.symbol.replace('-EQ', ''))}</b>\n"
             f"{'─' * 28}\n"
             f"📊 Strategy:      {strategy}\n"
             f"🎯 Confidence:    {conf_pct}\n"

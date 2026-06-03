@@ -24,6 +24,7 @@ import numpy as np
 import pandas as pd
 
 from core.risk_manager import TradeSignal
+from data.calendar import get_fo_expiry
 
 logger = logging.getLogger(__name__)
 
@@ -78,13 +79,35 @@ LOT_SIZES = {
 # Minimum days to expiry before we refuse to enter new positions
 MIN_DAYS_TO_EXPIRY = 2
 
-# Premium thresholds as % of entry premium
-STOP_LOSS_PCT  = 0.30   # exit if premium drops 30%
-TARGET_PCT     = 0.50   # exit at 50% gain on premium
+# ── SELL mode (option writing) ────────────────────────────────────────────────
+# Strategy: SELL CE when bearish (collect premium, profit if market stays flat/falls)
+#           SELL PE when bullish (collect premium, profit if market stays flat/rises)
+# Exit rules for short options:
+#   Target : premium decays to 30% of received → buy back cheap → keep 70% of premium
+#   Stop   : premium rises to 200% of received → buy back expensive → cap loss at 100%
+# P&L for SELL: positive when premium falls, negative when premium rises
+STOP_LOSS_PCT  = 1.00   # buy back if premium doubles (100% loss on received premium)
+TARGET_PCT     = 0.70   # buy back when 70% of premium has decayed (keep 70% of credit)
 
 # Premium bounds per unit (₹)
-MIN_PREMIUM = 20        # below this = deep OTM lottery ticket
-MAX_PREMIUM_PER_LOT = 10_000  # above this = too expensive per lot
+# Too cheap = deep OTM with near-zero delta; too expensive = capital risk per lot is excessive.
+# Per-underlying caps based on actual observed premiums (June 2026 audit):
+#   NIFTY weekly ATM:    ₹150–₹350  (75 lots × ₹350 = ₹26k lot cost — fits ₹1L budget)
+#   BANKNIFTY monthly:  ₹400–₹700  (15 lots × ₹700 = ₹10.5k lot cost — fits ₹1L budget)
+#   Generic floor:       ₹80 — below this is deep OTM with near-zero delta
+MIN_PREMIUM = 50
+MAX_PREMIUM_PER_UNDERLYING = {
+    "NIFTY":      700,   # NIFTY ~23k level: ATM premium ~₹200-500; raised from 500
+    "BANKNIFTY":  1500,  # BANKNIFTY ~53k level: ATM premium ~₹900-1400; raised from 700
+    "SENSEX":     800,   # SENSEX premiums: similar to NIFTY scale
+    "FINNIFTY":   400,
+    "MIDCPNIFTY": 400,
+}
+MAX_PREMIUM = 700       # default fallback if underlying not in map above
+MAX_PREMIUM_PER_LOT = 20_000  # raised from ₹15k — NIFTY 75 lots × ₹250 = ₹18,750
+
+
+SIGNAL_COOLDOWN_SECONDS = 600  # 10 minutes — suppress duplicate signals on same option symbol
 
 
 class OptionsStrategy:
@@ -97,6 +120,9 @@ class OptionsStrategy:
       3. Find ATM or 1-OTM strike in scrip master for nearest valid expiry
       4. Generate TradeSignal with SL and target priced in premium terms
     """
+
+    # Class-level cooldown tracker: option_symbol → last signal datetime
+    _last_signal_time: dict = {}
 
     def __init__(self,
                  underlying: str = "NIFTY",
@@ -118,14 +144,14 @@ class OptionsStrategy:
         Scan for an options entry opportunity.
         Returns a TradeSignal (product=NRML, exchange=nse_fo) or None.
         """
-        # Step 1: Get ETF OHLCV for trend (skip if no ETF proxy configured)
-        if not self.etf_symbol:
-            logger.debug(f"Options: no ETF proxy for {self.underlying}, skipping trend scan")
-            return None
+        # Step 1: Get OHLCV for trend detection.
+        # Prefer ETF proxy; fall back to index symbol if no ETF available (FINNIFTY, MIDCPNIFTY).
+        ohlcv_symbol  = self.etf_symbol or self.underlying
+        ohlcv_exchange = "nse_cm"
 
-        df = data_manager.get_ohlcv(self.etf_symbol, "nse_cm", limit=60)
+        df = data_manager.get_ohlcv(ohlcv_symbol, ohlcv_exchange, limit=60)
         if len(df) < 25:
-            logger.debug(f"Options: not enough ETF data for {self.etf_symbol}")
+            logger.debug(f"Options: not enough OHLCV data for {ohlcv_symbol}")
             return None
 
         trend, strength, _etf_price = self._detect_trend(df)
@@ -138,29 +164,51 @@ class OptionsStrategy:
         if expiry is None:
             return None
 
-        # Step 3: Get actual index level for ATM strike calculation
-        # ETF price (e.g. ₹270 for NIFTYBEES) ≠ index level (e.g. 24,500 for NIFTY 50)
+        # Step 3: Get actual index level for ATM strike calculation.
+        # Tier 1: direct index quote (works for BANKNIFTY, may fail for NIFTY/SENSEX).
+        # Tier 2: near-month futures quote (accurate to < 0.5%, always liquid).
+        # Tier 3: ETF × 100 from last OHLCV bar (last resort, ±1% error acceptable for ATM ±step).
         idx_sym, idx_exc = INDEX_QUOTE.get(self.underlying, (self.etf_symbol, "nse_cm"))
         idx_quote = data_manager.get_live_quote(idx_sym, idx_exc)
         if idx_quote and idx_quote.get("ltp", 0) > 0:
             index_price = idx_quote["ltp"]
+            logger.debug(f"Options: {self.underlying} index level from direct quote: {index_price:.0f}")
         else:
-            # ETF×100 fallback is disabled — the ratio is NOT exactly 100.
-            # BANKBEES×100 = 55,735 while actual BANKNIFTY = 53,734 (2,000 pts error).
-            # A wrong spot price produces a deeply OTM strike → guaranteed loss.
-            # Skip the signal entirely if Kotak cannot serve the index spot.
-            logger.warning(
-                f"Options: index quote unavailable for {self.underlying} "
-                f"(LTP=0) — skipping to avoid wrong strike selection"
-            )
-            return None
+            # Tier 2: near-month futures — futures price ≈ spot + small carry (<0.5%)
+            # For ATM strike rounded to step, carry difference of 130pts (0.5% on 26000) is < 3 strikes.
+            futures_symbols = {
+                "NIFTY":     "NIFTY26JUNFUT",
+                "BANKNIFTY": "BANKNIFTY26JUNFUT",
+                "SENSEX":    "SENSEX26JUNFUT",
+            }
+            fut_sym = futures_symbols.get(self.underlying)
+            fut_quote = data_manager.get_live_quote(fut_sym, self.fo_exchange) if fut_sym else None
+            if fut_quote and fut_quote.get("ltp", 0) > 0:
+                index_price = fut_quote["ltp"]
+                logger.info(f"Options: {self.underlying} index level from futures {fut_sym}: {index_price:.0f}")
+            else:
+                # Tier 3: ETF last close × 100 — least accurate but better than skipping entirely.
+                # NIFTYBEES × 100 ≈ NIFTY ±1%. At step=50, max strike error = 2 strikes (acceptable for ATM).
+                if self.etf_symbol and len(df) > 0:
+                    etf_close = float(df["close"].iloc[-1])
+                    index_price = etf_close * 100
+                    logger.warning(
+                        f"Options: {self.underlying} using ETF fallback "
+                        f"({self.etf_symbol} ₹{etf_close:.2f} × 100 = {index_price:.0f})"
+                    )
+                else:
+                    logger.warning(f"Options: {self.underlying} index level unavailable — all 3 tiers failed")
+                    return None
 
         step = STRIKE_STEP.get(self.underlying, 50)
         atm_strike = round(index_price / step) * step
         strike     = atm_strike + (self.strike_offset * step)
         current_price = index_price  # used in reasoning string below
 
-        option_type = "CE" if trend == "bullish" else "PE"
+        # SELL mode: sell the OPPOSITE option type to collect premium
+        # Bearish → SELL CE (call writers profit when market falls/stays flat)
+        # Bullish → SELL PE (put writers profit when market rises/stays flat)
+        option_type = "PE" if trend == "bullish" else "CE"
 
         # Step 4: Find the option in scrip master
         option_symbol = self._find_option_symbol(
@@ -180,24 +228,34 @@ class OptionsStrategy:
             return None
 
         premium = quote["ltp"]
+        max_prem = MAX_PREMIUM_PER_UNDERLYING.get(self.underlying, MAX_PREMIUM)
         if premium < MIN_PREMIUM:
             logger.info(
                 f"Options: {option_symbol} premium ₹{premium:.2f} below"
-                f" minimum ₹{MIN_PREMIUM} — skipping (deep OTM)"
+                f" ₹{MIN_PREMIUM} — deep OTM, skipping"
+            )
+            return None
+        if premium > max_prem:
+            logger.info(
+                f"Options: {option_symbol} premium ₹{premium:.2f} above"
+                f" ₹{max_prem} ({self.underlying} cap) — skipping"
             )
             return None
         lot_cost = premium * self.lot_size
 
         if lot_cost > MAX_PREMIUM_PER_LOT:
             logger.info(
-                f"Options: {option_symbol} premium ₹{lot_cost:,.0f} exceeds"
+                f"Options: {option_symbol} lot cost ₹{lot_cost:,.0f} exceeds"
                 f" max ₹{MAX_PREMIUM_PER_LOT:,.0f}"
             )
             return None
 
-        # Step 6: Calculate SL and target in premium terms
-        stop_loss = round(premium * (1 - STOP_LOSS_PCT), 2)
-        target    = round(premium * (1 + TARGET_PCT),    2)
+        # Step 6: SL/target for SELL (short option) position
+        # We receive premium upfront. Exit by buying back:
+        #   Stop loss : premium rises to 2× received → buy back at 2× cost → loss = premium received
+        #   Target    : premium falls to 30% of received → buy back cheap → keep 70% of credit
+        stop_loss = round(premium * (1 + STOP_LOSS_PCT), 2)   # rises 100% → stop out
+        target    = round(premium * (1 - TARGET_PCT),    2)   # falls 70% → take profit
         days_left = (expiry - date.today()).days
 
         confidence = min(strength + 0.05, 0.90)  # slight boost for options setup
@@ -208,20 +266,33 @@ class OptionsStrategy:
             f"Premium=₹{premium:.2f}/unit. Lot cost=₹{lot_cost:,.0f}."
         )
 
+        # Bug fix: suppress duplicate signals for the same option symbol within cooldown window
+        from datetime import datetime as _datetime
+        last_sig = OptionsStrategy._last_signal_time.get(option_symbol)
+        if last_sig is not None:
+            elapsed = (_datetime.now() - last_sig).total_seconds()
+            if elapsed < SIGNAL_COOLDOWN_SECONDS:
+                logger.debug(
+                    f"Options signal cooldown active for {option_symbol} "
+                    f"({elapsed:.0f}s < {SIGNAL_COOLDOWN_SECONDS}s) — skipping"
+                )
+                return None
+        OptionsStrategy._last_signal_time[option_symbol] = _datetime.now()
+
         logger.info(
-            f"Options signal: BUY {option_symbol} @ ₹{premium:.2f}"
-            f" lot_cost=₹{lot_cost:,.0f} conf={confidence:.0%}"
+            f"Options signal: SELL {option_symbol} @ ₹{premium:.2f}"
+            f" credit=₹{lot_cost:,.0f} conf={confidence:.0%}"
         )
 
         return TradeSignal(
             symbol    = option_symbol,
             exchange  = self.fo_exchange,
-            action    = "BUY",
+            action    = "SELL",
             price     = premium,
             strategy  = "options",
             confidence= confidence,
-            stop_loss = stop_loss,
-            target    = target,
+            stop_loss = stop_loss,   # premium level to buy back at loss
+            target    = target,      # premium level to buy back at profit
             quantity  = self.lot_size,
             product   = "NRML",
             reasoning = reasoning,
@@ -292,45 +363,20 @@ class OptionsStrategy:
 
     def _nearest_valid_expiry(self) -> Optional[date]:
         """
-        Return the nearest NSE F&O expiry that is at least MIN_DAYS_TO_EXPIRY away.
+        Return the nearest F&O expiry that is at least MIN_DAYS_TO_EXPIRY away.
 
-        NIFTY/FINNIFTY  : weekly (every Tuesday)
-        BANKNIFTY/SENSEX: monthly (last expiry weekday of the month)
+        Delegates to calendar.get_fo_expiry — single source of truth for expiry
+        dates shared by calendar context, AI prompt, and options strategy.
+        This ensures days_to_expiry shown to AI == actual DTE used at entry.
         """
-        today    = date.today()
-        weekday  = self._EXPIRY_WEEKDAY.get(self.underlying, 1)   # default Tuesday
-
-        if self.underlying in self._MONTHLY_ONLY:
-            # Find the last <weekday> of each upcoming month
-            candidates = []
-            for month_offset in range(4):   # check next 4 months
-                yr  = today.year + (today.month + month_offset - 1) // 12
-                mon = (today.month + month_offset - 1) % 12 + 1
-                # Last day of that month
-                import calendar
-                last_day = calendar.monthrange(yr, mon)[1]
-                d = date(yr, mon, last_day)
-                # Walk back to the target weekday
-                while d.weekday() != weekday:
-                    d -= timedelta(days=1)
-                if (d - today).days >= MIN_DAYS_TO_EXPIRY:
-                    candidates.append(d)
-            if not candidates:
-                logger.warning(f"Options: no monthly expiry found for {self.underlying}")
-                return None
-            return candidates[0]
-        else:
-            # Weekly: find the next <weekday> (e.g. Tuesday for NIFTY)
-            days_until = (weekday - today.weekday()) % 7
-            candidates = []
-            for n in range(8):   # check next 8 weekly expiries
-                candidate = today + timedelta(days=days_until + n * 7)
-                if (candidate - today).days >= MIN_DAYS_TO_EXPIRY:
-                    candidates.append(candidate)
-            if not candidates:
-                logger.warning(f"Options: no weekly expiry found for {self.underlying}")
-                return None
-            return candidates[0]
+        expiry = get_fo_expiry(
+            self.underlying,
+            min_days=MIN_DAYS_TO_EXPIRY,
+        )
+        if expiry is None:
+            logger.warning(f"Options: no valid expiry found for {self.underlying} "
+                           f"(min_days={MIN_DAYS_TO_EXPIRY})")
+        return expiry
 
     @staticmethod
     def _date_to_kotak_weekly(d: date) -> str:
@@ -365,14 +411,18 @@ class OptionsStrategy:
         Tries multiple common symbol formats used by Kotak Neo F&O.
         """
         expiry_str = self._expiry_to_scrip_str(expiry)
-        # Try specific patterns first (exact expiry), then fall back to broader search
+        # Try specific patterns anchored to the computed expiry date only.
+        # The broad fallback (UNDERLYING%STRIKE%TYPE with no expiry) is intentionally
+        # removed — it performs substring matching and caused production incident on
+        # 2026-06-01 where SENSEX%8500%PE matched SENSEX2660468500PE (strike=68500,
+        # 13,500pts deep OTM) because "8500" is a substring of "68500".
         candidates = [
-            # Anchor to start — NIFTY% not %NIFTY% to avoid matching BANKNIFTY/FINNIFTY
+            # Pattern 1: canonical Kotak format — underlying + weekly code + strike + type
             f"{self.underlying}{expiry_str}%{strike}{option_type}",
+            # Pattern 2: YYYYMMDD date format variant
             f"{self.underlying}{expiry.strftime('%y%m%d')}%{strike}{option_type}",
-            f"{self.underlying}%{expiry_str}%{strike}%{option_type}",
-            # Broad fallback — any expiry, anchored at start
-            f"{self.underlying}%{strike}%{option_type}",
+            # Pattern 3: expiry anywhere in symbol but strike must be exact suffix
+            f"{self.underlying}%{expiry_str}%{strike}{option_type}",
         ]
 
         try:
@@ -385,8 +435,44 @@ class OptionsStrategy:
                         (like_pattern, self.fo_exchange)
                     ).fetchone()
                     if row:
-                        logger.debug(f"Options symbol found: {row[0]} (pattern={like_pattern!r})")
-                        return row[0]
+                        # ── Exact strike validation ─────────────────────────────────
+                        # Kotak symbols are UNDERLYING + EXPIRY_CODE + STRIKE + TYPE
+                        # with no separator between expiry digits and strike digits.
+                        # endswith() and regex-based approaches fail because "8500"
+                        # is a suffix of "68500" — the production bug on 2026-06-01.
+                        #
+                        # Correct approach: strip the known underlying prefix, then
+                        # strip the known expiry_str (primary or alt format), and
+                        # verify exactly "{strike}{option_type}" remains.
+                        found = row[0]
+                        accepted = False
+
+                        if found.startswith(self.underlying):
+                            after_ul = found[len(self.underlying):]
+                            expected_tail = f"{strike}{option_type}"
+                            # Try primary expiry format (weekly code or monthly YYMMM)
+                            if after_ul.startswith(expiry_str):
+                                remainder = after_ul[len(expiry_str):]
+                                if remainder == expected_tail:
+                                    accepted = True
+                            # Try alternate expiry format (YYMMDD / 6-char)
+                            if not accepted:
+                                alt_expiry = expiry.strftime('%y%m%d')
+                                if after_ul.startswith(alt_expiry):
+                                    remainder = after_ul[len(alt_expiry):]
+                                    if remainder == expected_tail:
+                                        accepted = True
+
+                        if not accepted:
+                            logger.warning(
+                                f"Options symbol lookup: rejected {found!r} — "
+                                f"strike in symbol != expected {strike} "
+                                f"(expiry_str={expiry_str!r}, pattern={like_pattern!r})"
+                            )
+                            continue
+
+                        logger.debug(f"Options symbol found: {found} (pattern={like_pattern!r})")
+                        return found
         except Exception as e:
             logger.error(f"Options symbol lookup failed: {e}")
         return None

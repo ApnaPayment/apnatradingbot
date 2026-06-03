@@ -35,7 +35,7 @@ _RANGE_BUTTONS = dict(
 )
 
 
-def chart_component(ohlcv_df=None, trades_df=None, symbol="NIFTYBEES-EQ"):
+def chart_component(ohlcv_df=None, trades_df=None, symbol="NIFTYBEES-EQ", decisions_df=None):
     if ohlcv_df is None or ohlcv_df.empty:
         fig = go.Figure()
         fig.add_annotation(
@@ -160,6 +160,50 @@ def chart_component(ohlcv_df=None, trades_df=None, symbol="NIFTYBEES-EQ"):
                     ))
             except Exception:
                 pass
+
+    # AI decision markers — vetoes (red ✕) and approvals (green ★) for this symbol
+    sym_bare = symbol.replace("-EQ", "").replace(".BO", "")
+    if decisions_df is not None and not decisions_df.empty:
+        # Match on full symbol OR bare name (e.g. "LT-EQ" or "LT")
+        dec = decisions_df[
+            decisions_df["symbol"].str.replace("-EQ", "").str.replace(".BO", "") == sym_bare
+        ].copy()
+        if not dec.empty:
+            dec["decided_at"] = pd.to_datetime(dec["decided_at"], errors="coerce")
+            dec = dec.dropna(subset=["decided_at"])
+            approved = dec[dec["approved"] == 1]
+            vetoed   = dec[dec["approved"] == 0]
+            if not approved.empty:
+                fig.add_trace(go.Scatter(
+                    x=approved["decided_at"],
+                    y=approved["signal_price"],
+                    mode="markers",
+                    name="AI Approved",
+                    marker=dict(size=12, color="#00ff88", symbol="star",
+                                line=dict(color="#ffffff", width=1)),
+                    hovertext=approved.apply(
+                        lambda r: f"✅ APPROVED {r.get('action','')}<br>"
+                                  f"Strategy: {r.get('strategy','')}<br>"
+                                  f"₹{r.get('signal_price',0):,.2f}  conf={r.get('signal_conf',0):.0%}",
+                        axis=1),
+                    hoverinfo="text",
+                ))
+            if not vetoed.empty:
+                fig.add_trace(go.Scatter(
+                    x=vetoed["decided_at"],
+                    y=vetoed["signal_price"],
+                    mode="markers",
+                    name="AI Veto",
+                    marker=dict(size=12, color="#ff4444", symbol="x",
+                                line=dict(color="#ffffff", width=1)),
+                    hovertext=vetoed.apply(
+                        lambda r: f"🚫 VETO {r.get('action','')}<br>"
+                                  f"Strategy: {r.get('strategy','')}<br>"
+                                  f"₹{r.get('signal_price',0):,.2f}<br>"
+                                  f"{str(r.get('veto_reason',''))[:80]}",
+                        axis=1),
+                    hoverinfo="text",
+                ))
 
     # Default to today's trading session (09:15 today → latest candle)
     # Avoids the overnight flat-EMA artifact from a naive "last 24 hours" window

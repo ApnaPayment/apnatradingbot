@@ -164,7 +164,9 @@ class MomentumStrategy:
                 and buy_score >= 3):
             confidence = min(0.5 + (buy_score * 0.1), 0.95)
             stop_loss  = round(current_price - (2 * atr), 2)
-            target     = round(current_price + (3 * atr), 2)
+            # Derive target from stop distance to guarantee exact 2:1 R:R
+            # Using 3×ATR independently gives R:R=1.5:1 (stop=2×ATR, target=3×ATR)
+            target     = round(current_price + 2 * (current_price - stop_loss), 2)
 
             signal = TradeSignal(
                 symbol=symbol, exchange=exchange,
@@ -188,11 +190,16 @@ class MomentumStrategy:
             sell_score = sum(sell_conditions.values())
             if sell_conditions["ema_crossover"] and sell_score >= 2:
                 confidence = min(0.5 + (sell_score * 0.1), 0.90)
+                sl_sell   = round(current_price + 2 * atr, 2)   # stop above entry for SELL
+                tgt_sell  = round(current_price - 2 * (sl_sell - current_price), 2)  # 2:1 R:R
                 signal = TradeSignal(
                     symbol=symbol, exchange=exchange,
                     action="SELL", price=current_price,
                     strategy="momentum",
                     confidence=confidence,
+                    stop_loss=sl_sell,
+                    target=tgt_sell,
+                    product="CNC",
                     reasoning=self._build_reasoning("SELL", sell_conditions, latest, atr),
                 )
 

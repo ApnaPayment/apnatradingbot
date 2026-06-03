@@ -36,9 +36,10 @@ logger = logging.getLogger(__name__)
 from core.kotak_client import KotakNeoClient
 from core.risk_manager import RiskManager, RiskConfig, TradeSignal
 from data.data_manager import DataManager
+from data.liquidity_db import LiquidityDataManager as _LiqDB
 from strategies.momentum import MomentumStrategy
 from strategies.mean_reversion import MeanReversionStrategy
-from strategies.options import OptionsStrategy
+from strategies.options import OptionsStrategy, STOP_LOSS_PCT as _OPT_SL_PCT, TARGET_PCT as _OPT_TGT_PCT
 from strategies.stock_options import StockOptionsStrategy, STOCK_OPTIONS_CONFIG
 from ai.decision_engine import AIDecisionEngine
 from ai.signal_aggregator import SignalAggregator
@@ -77,14 +78,21 @@ NSE_HOLIDAYS: set[date] = {
     date(2025, 11, 5),   # Diwali (Laxmi Puja) — Muhurat session only
     date(2025, 11, 14),  # Gurunanak Jayanti
     date(2025, 12, 25),  # Christmas
-    # 2026 — update when NSE publishes the official list
+    # 2026 — NSE official trading holiday list (FY 2026-27)
     date(2026, 1, 26),   # Republic Day
-    date(2026, 3, 20),   # Holi (placeholder — confirm with NSE)
-    date(2026, 4, 3),    # Good Friday (placeholder)
-    date(2026, 4, 14),   # Dr. Ambedkar Jayanti
-    date(2026, 5, 1),    # Maharashtra Day
+    date(2026, 2, 26),   # Mahashivratri
+    date(2026, 3, 25),   # Holi
+    date(2026, 4, 2),    # Ram Navami
+    date(2026, 4, 3),    # Good Friday
+    date(2026, 4, 14),   # Dr. Ambedkar Jayanti / Mahavir Jayanti
+    date(2026, 5, 1),    # Maharashtra Day / Labour Day
+    date(2026, 6, 19),   # Bakri Id (Eid ul-Adha)
     date(2026, 8, 15),   # Independence Day
-    date(2026, 10, 2),   # Gandhi Jayanti
+    date(2026, 8, 27),   # Ganesh Chaturthi
+    date(2026, 10, 2),   # Gandhi Jayanti / Dussehra
+    date(2026, 10, 21),  # Diwali Laxmi Puja
+    date(2026, 10, 22),  # Diwali Balipratipada
+    date(2026, 11, 4),   # Gurunanak Jayanti
     date(2026, 12, 25),  # Christmas
 }
 
@@ -92,7 +100,7 @@ NSE_HOLIDAYS: set[date] = {
 # Watchlist — edit this to your preferred stocks
 # ─────────────────────────────────────────────────────────────────────────────
 WATCHLIST = [
-    # Large-cap stocks — original
+    # Large-cap stocks — high ATR, high liquidity
     "RELIANCE-EQ", "TCS-EQ", "INFY-EQ", "HDFCBANK-EQ",
     "ICICIBANK-EQ", "WIPRO-EQ", "LT-EQ", "AXISBANK-EQ",
     "SBIN-EQ", "BHARTIARTL-EQ", "BAJFINANCE-EQ",
@@ -114,9 +122,13 @@ WATCHLIST = [
     "NTPC-EQ", "POWERGRID-EQ",
     # Metals
     "TATASTEEL-EQ",
-    # Index ETFs
-    "NIFTYBEES-EQ", "BANKBEES-EQ", "HDFCSENSEX-EQ", "ITBEES-EQ",
+    # NOTE: ETFs (NIFTYBEES, ITBEES, BANKBEES, HDFCSENSEX) removed from equity watchlist.
+    # Their 5-min ATR is too small to cover ₹52 round-trip costs on ₹10k positions.
+    # They are still used inside OptionsStrategy as index price proxies — not for equity signals.
 ]
+
+# ETF proxies — used ONLY by OptionsStrategy for index price approximation, NOT for equity signals
+OPTIONS_ETF_PROXIES = ["NIFTYBEES-EQ", "BANKBEES-EQ", "HDFCSENSEX-EQ", "ITBEES-EQ"]
 
 
 class AlgoTrader:
@@ -202,14 +214,17 @@ class AlgoTrader:
             logger.error("Authentication failed. Cannot start.")
             self.telegram.alert_error("Authentication failed", "startup")
             return False
+        self._persist_kotak_session()
 
         if not self.data.is_scrip_master_fresh():
             logger.info("Downloading scrip master...")
             self.data.download_scrip_master()
 
         # Bootstrap OHLCV on every startup so strategies have warm data immediately
+        # Include ETF proxies needed for regime detection even though they're not equity targets
+        _bootstrap_syms = list(dict.fromkeys(self.active_watchlist + OPTIONS_ETF_PROXIES))
         logger.info("Bootstrapping 5m OHLCV from yfinance (60-day intraday limit)...")
-        candles = self.data.bootstrap_ohlcv(self.active_watchlist, period="60d", interval="5m")
+        candles = self.data.bootstrap_ohlcv(_bootstrap_syms, period="60d", interval="5m")
         logger.info(f"5m OHLCV bootstrap: {candles:,} candles ready")
 
         # Daily OHLCV — fetch up to 1 year; skips if data is already fresh (< 1 day old)
@@ -230,7 +245,9 @@ class AlgoTrader:
         logger.info(f"Session: {session}")
 
         # Start WebSocket streaming for real-time ticks
-        self.ws.subscribe_watchlist(self.active_watchlist)
+        # Subscribe equity watchlist + ETF proxies (needed for regime detection live ticks)
+        _ws_syms = list(dict.fromkeys(self.active_watchlist + OPTIONS_ETF_PROXIES))
+        self.ws.subscribe_watchlist(_ws_syms)
         self.ws.start()
         logger.info(f"WebSocket: {self.ws.status()}")
 
@@ -239,6 +256,11 @@ class AlgoTrader:
         if self._cmd_handler:
             self._cmd_handler.start()
             logger.info("Telegram command handler ready — send /help in chat")
+
+        # ── Bug Fix: restore open_positions and daily_pnl from DB before first cycle ──
+        # Without this, a restart zeros daily_pnl (bypasses loss limit) and loses
+        # all open position references (no stop-loss monitoring after crash/restart).
+        self.risk.restore_from_db(self.data)
 
         # Mark bot as running in DB — sleep 3s first so any prior process shutdown
         # (which writes "stopped") completes before we overwrite with "running"
@@ -570,7 +592,7 @@ class AlgoTrader:
                 )
                 return
 
-            self._signals_today += len(signals[:2])
+            self._signals_today += len(signals)
             for signal in signals[:2]:
                 try:
                     # Option B: convert momentum equity signal → stock ATM option
@@ -834,12 +856,8 @@ class AlgoTrader:
 
         ai_result = self.ai.evaluate_signal(signal, portfolio, market_context, news_sentiment)
 
-        # Phase 6: record this decision immediately so outcome can be linked later
-        decision_id = record_ai_decision(
-            signal.symbol, signal.action, signal.strategy,
-            signal.confidence, signal.price, ai_result,
-        )
-        signal._decision_id = decision_id   # carried into _execute_trade → position dict
+        # Phase 6: decision recorded below after veto/approve branch (not here — avoids duplicates)
+        decision_id = None
 
         tools_used = ai_result.get("tools_used", [])
         if tools_used:
@@ -874,6 +892,7 @@ class AlgoTrader:
                 "target":            signal.target,
                 "market_regime":     getattr(self, "_market_regime", "unknown"),
             })
+            signal._decision_id = decision_id
 
             # Record veto for accuracy tracking — assessed at EOD
             self._veto_outcomes.append({
@@ -956,26 +975,34 @@ class AlgoTrader:
 
             if stat == "Ok" or result.get("paper"):
                 logger.info(f"Order placed: {signal.symbol} | Order No: {order_no}")
-                self.risk.record_entry(signal, order_no)
-                # Attach decision_id to the position so _exit_position can link outcome
-                pos = self.risk.open_positions.get(signal.symbol, {})
-                if pos and hasattr(signal, "_decision_id"):
-                    pos["_decision_id"] = signal._decision_id
+                self.risk.record_entry(signal, order_no)  # _decision_id saved inside record_entry
                 if signal.product == "NRML":
                     # F&O entry — send rich options alert
                     import re as _re
-                    _m = _re.match(r'([A-Z]+)(\d{2}[A-Z]{3}\d{2,4})(\d+)(CE|PE)', signal.symbol)
-                    _underlying  = _m.group(1) if _m else signal.symbol
-                    _strike      = int(_m.group(3)) if _m else 0
-                    _option_type = _m.group(4) if _m else ""
+                    # Parse option symbol — two formats used by Kotak:
+                    #   Monthly: BANKNIFTY26JUN55700CE → YY + MMM + strike
+                    #   Weekly:  NIFTY2660923300PE     → YY + single-digit-month-code + DD + strike
+                    _opt_type = signal.symbol[-2:] if signal.symbol[-2:] in ("CE", "PE") else ""
+                    _underlying = (_re.match(r'([A-Z]+)', signal.symbol) or _re.match(r'', "")).group(0) or signal.symbol
+                    _strike = 0
+                    _monthly = _re.search(r'\d{2}[A-Z]{3}(\d{4,6})(?:CE|PE)', signal.symbol)
+                    _weekly  = _re.search(r'\d{2}[1-9OND]\d{2}(\d{4,6})(?:CE|PE)', signal.symbol)
+                    if _monthly:
+                        _strike = int(_monthly.group(1))
+                    elif _weekly:
+                        _strike = int(_weekly.group(1))
+                    _option_type = _opt_type
                     _days_left   = self._fo_days_to_expiry(signal.symbol)
+                    from datetime import date as _date, timedelta as _td
+                    _expiry_date = (_date.today() + _td(days=_days_left)).strftime("%d %b %Y") \
+                        if _days_left < 99 else None
                     self.telegram.alert_fo_trade(
                         symbol=signal.symbol,
                         action=signal.action,
                         qty=signal.quantity,
                         premium=signal.price,
                         strike=_strike,
-                        expiry=None,
+                        expiry=_expiry_date,
                         option_type=_option_type,
                         underlying=_underlying,
                         days_to_expiry=_days_left,
@@ -1071,14 +1098,32 @@ class AlgoTrader:
                 continue
             pnl_pct = (current - entry) / entry
 
-            if pnl_pct >= 0.50:
-                logger.info(f"F&O TARGET 50%: {symbol} @ ₹{current}")
-                self._exit_fo_position(symbol, pos, current, "target_50pct")
-            elif pnl_pct <= -0.30:
-                logger.info(f"F&O STOP 30%: {symbol} @ ₹{current}")
-                self._sl_cooldown[symbol] = datetime.now()
-                self._exit_fo_position(symbol, pos, current, "sl_30pct")
-            elif self._fo_days_to_expiry(symbol) <= 1:
+            exited = False
+            if pos.get("action") == "SELL":
+                # Short option: profit when premium FALLS, loss when premium RISES
+                # Target: premium decayed by 70% (current = 30% of entry)
+                # Stop  : premium doubled (current = 200% of entry)
+                if pnl_pct <= -_OPT_TGT_PCT:
+                    logger.info(f"F&O SHORT TARGET (premium -{_OPT_TGT_PCT:.0%}): {symbol} @ ₹{current}")
+                    self._exit_fo_position(symbol, pos, current, "target_70pct")
+                    exited = True
+                elif pnl_pct >= _OPT_SL_PCT:
+                    logger.info(f"F&O SHORT STOP (premium +100%): {symbol} @ ₹{current}")
+                    self._sl_cooldown[symbol] = datetime.now()
+                    self._exit_fo_position(symbol, pos, current, "sl_100pct")
+                    exited = True
+            else:
+                # Long option (BUY): profit when premium RISES
+                if pnl_pct >= 0.50:
+                    logger.info(f"F&O TARGET 50%: {symbol} @ ₹{current}")
+                    self._exit_fo_position(symbol, pos, current, "target_50pct")
+                    exited = True
+                elif pnl_pct <= -0.30:
+                    logger.info(f"F&O STOP 30%: {symbol} @ ₹{current}")
+                    self._sl_cooldown[symbol] = datetime.now()
+                    self._exit_fo_position(symbol, pos, current, "sl_30pct")
+                    exited = True
+            if not exited and self._fo_days_to_expiry(symbol) <= 1:
                 logger.info(f"F&O EXPIRY EXIT (1 day left): {symbol}")
                 self._exit_fo_position(symbol, pos, current, "expiry_exit")
 
@@ -1414,12 +1459,14 @@ class AlgoTrader:
         self._prev_cb_state = CBState.NORMAL
         self.data.download_scrip_master()
         self.client.authenticate()
+        self._persist_kotak_session()
         # Purge old ticks (keep 2 days) and old events (keep 30 days)
         self.data.cleanup_old_data(tick_days=2, events_days=30)
 
-        # Bootstrap 5m OHLCV for indicator warm-up
+        # Bootstrap 5m OHLCV for indicator warm-up (include ETF proxies for regime detection)
+        _bootstrap_syms = list(dict.fromkeys(self.active_watchlist + OPTIONS_ETF_PROXIES))
         logger.info("Bootstrapping 5m OHLCV from yfinance...")
-        candles = self.data.bootstrap_ohlcv(self.active_watchlist, period="60d", interval="5m")
+        candles = self.data.bootstrap_ohlcv(_bootstrap_syms, period="60d", interval="5m")
         logger.info(f"5m OHLCV bootstrap: {candles:,} candles loaded")
 
         # Append yesterday's daily close to the 1-year daily dataset
@@ -1889,6 +1936,21 @@ class AlgoTrader:
         """Re-authenticate every 6 hours."""
         logger.info("Refreshing session...")
         self.client.authenticate()
+        self._persist_kotak_session()
+
+    def _persist_kotak_session(self):
+        """Save Kotak session token to shared SQLite so MCX engine can use it."""
+        try:
+            token = getattr(self.client, "session_token", None)
+            sid   = getattr(self.client, "session_sid", None)
+            base  = getattr(self.client, "base_url", None)
+            if token and sid and base:
+                _LiqDB().save_session_token(token, sid, base)
+                logger.info("main: Kotak session persisted to shared DB for MCX engine")
+            else:
+                logger.warning("main: Kotak session not yet available — skipping persist")
+        except Exception as e:
+            logger.warning(f"main: Failed to persist Kotak session: {e}")
 
     # ─────────────────────────────────────────────────────────────────────────
     # Market hours

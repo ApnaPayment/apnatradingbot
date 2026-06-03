@@ -79,7 +79,7 @@ def kpi_cards_component(bot_status=None, trades_df=None):
         _card("Day P&L",         val(format_currency(daily_pnl), pnl_color),                    border_color=pnl_color if daily_pnl != 0 else "#2a3547"),
         _card("Open Positions",  val(str(num_positions), "#4dabf7")),
         _card("Win Rate",        val(format_percent(win_rate), "#ffd700")),
-        _card("Capital at Risk", val(f"{format_currency(capital_at_risk)} / ₹100K", "#e2e8f0", size="14px")),
+        _card("Capital at Risk", val(f"₹{capital_at_risk:,.0f} / ₹100K", "#e2e8f0", size="14px")),
     ]
 
     return html.Div(

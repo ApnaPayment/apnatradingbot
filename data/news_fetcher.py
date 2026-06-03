@@ -82,7 +82,7 @@ class NewsFetcher:
                 self._cookie_loaded = False
             except Exception as e:
                 if attempt == 2:
-                    logger.warning(f"VIX fetch failed after {attempt+1} attempts: {e}")
+                    logger.debug(f"VIX fetch failed after {attempt+1} attempts: {e}")
         return None
 
     def get_fii_dii_flows(self) -> dict:

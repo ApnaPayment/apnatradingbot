@@ -1,0 +1,17 @@
+[Unit]
+Description=AlgoTrader Liquidity Engine (BSE/MCX/CDE paper trading)
+After=network.target algotrader.service
+Wants=algotrader.service
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/algo_trader
+ExecStart=/root/algo_trader/venv/bin/python liquidity_main.py --segments mcx_fo
+Restart=on-failure
+RestartSec=30
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

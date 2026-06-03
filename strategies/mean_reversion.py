@@ -176,7 +176,9 @@ class MeanReversionStrategy:
                 and buy_score >= 4):
             confidence = min(0.50 + buy_score * 0.08, 0.90)
             stop_loss  = round(current_price - 1.5 * atr, 2)
-            target     = round(current_price + 3.0 * atr, 2)   # R:R = 2.0 (passes 1.5 min)
+            # Compute target as exactly 2× the stop distance to guarantee R:R ≥ 2.0
+            # Using 3×ATR independently causes rounding divergence → AI sees 1.9996:1
+            target     = round(current_price + 2 * (current_price - stop_loss), 2)
 
             signal = TradeSignal(
                 symbol=symbol, exchange=exchange,
