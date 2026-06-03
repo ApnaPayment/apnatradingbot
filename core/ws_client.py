@@ -31,8 +31,10 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
-# Kotak Neo streaming endpoint — adjust path if the API changes
-_WS_HOST = "wss://mlhybrid.kotaksecurities.com"
+# Kotak Neo streaming endpoint.
+# The host is derived dynamically from the auth base_url (e.g. https://e41.kotaksecurities.com
+# → wss://e41.kotaksecurities.com). The old hardcoded mlhybrid subdomain is NXDOMAIN.
+_WS_HOST_FALLBACK = "wss://mlhybrid.kotaksecurities.com"  # kept for reference only
 _WS_PATH = "/websocket/v1/feed"
 
 
@@ -166,9 +168,18 @@ class KotakNeoWSClient:
             logger.warning("WS: not authenticated — skipping connection")
             return
 
+        # Derive WS host from the auth base_url returned by Kotak login
+        # e.g. https://e41.kotaksecurities.com → wss://e41.kotaksecurities.com
+        base_url = getattr(self.client, "base_url", None)
+        if base_url:
+            ws_host = base_url.replace("https://", "wss://").replace("http://", "ws://")
+        else:
+            ws_host = _WS_HOST_FALLBACK
+            logger.warning(f"WS: no base_url from auth — using fallback {ws_host}")
+
         # Build URL with auth query params
         url = (
-            f"{_WS_HOST}{_WS_PATH}"
+            f"{ws_host}{_WS_PATH}"
             f"?sid={self.client.session_sid}"
             f"&auth={self.client.session_token}"
         )
@@ -186,7 +197,7 @@ class KotakNeoWSClient:
             on_close=self._on_close,
         )
 
-        logger.info(f"WS: connecting to {_WS_HOST}{_WS_PATH}")
+        logger.info(f"WS: connecting to {ws_host}{_WS_PATH}")
         self._ws.run_forever(ping_interval=self.HEARTBEAT_INTERVAL, ping_timeout=10)
 
     # ─────────────────────────────────────────────────────────────────────────
