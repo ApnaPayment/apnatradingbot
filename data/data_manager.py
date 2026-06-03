@@ -189,7 +189,9 @@ class DataManager:
                     market_regime         TEXT    DEFAULT 'unknown',
                     ai_regime_confidence  REAL    DEFAULT 0,
                     ai_regime_suggestion  TEXT    DEFAULT '',
-                    ai_regime_risk        TEXT    DEFAULT 'medium'
+                    ai_regime_risk        TEXT    DEFAULT 'medium',
+                    cooldowns             TEXT    DEFAULT '{}',
+                    weekly_pnl            REAL    DEFAULT 0
                 );
 
                 CREATE TABLE IF NOT EXISTS events (
@@ -259,6 +261,8 @@ class DataManager:
             ("bot_status",    "ai_regime_confidence", "REAL",    "0"),
             ("bot_status",    "ai_regime_suggestion", "TEXT",    "''"),
             ("bot_status",    "ai_regime_risk",       "TEXT",    "'medium'"),
+            ("bot_status",    "cooldowns",            "TEXT",    "'{}'"),
+            ("bot_status",    "weekly_pnl",           "REAL",    "0"),
             # ai_decisions: extended columns for structured decision logging
             ("ai_decisions",  "final_confidence",     "REAL",    "0"),
             ("ai_decisions",  "signal_confidence",    "REAL",    "0"),
@@ -907,23 +911,28 @@ class DataManager:
                    daily_pnl=?, daily_trades=?, open_positions=?,
                    capital_at_risk=?, paper_trading=?, last_cycle=?, status=?,
                    market_regime=?, ai_regime_confidence=?,
-                   ai_regime_suggestion=?, ai_regime_risk=?
+                   ai_regime_suggestion=?, ai_regime_risk=?, cooldowns=?, weekly_pnl=?
                    WHERE id=1""",
                 (
                     portfolio.get("daily_pnl", 0),
                     portfolio.get("daily_trades", 0),
                     json.dumps({
                         k: {
-                            "action":      v["action"],
-                            "entry_price": v["entry_price"],
-                            "quantity":    v["quantity"],
-                            "stop_loss":   v["stop_loss"],
-                            "target":      v["target"],
-                            "strategy":    v.get("strategy", ""),
-                            "exchange":    v.get("exchange", "nse_cm"),
-                            "product":     v.get("product", "CNC"),
-                            "entry_time":  v.get("entry_time", ""),
-                            "order_no":    v.get("order_no", ""),
+                            "action":       v["action"],
+                            "entry_price":  v["entry_price"],
+                            "quantity":     v["quantity"],
+                            "stop_loss":    v["stop_loss"],
+                            "target":       v["target"],
+                            "strategy":     v.get("strategy", ""),
+                            "exchange":     v.get("exchange", "nse_cm"),
+                            "product":      v.get("product", "CNC"),
+                            "entry_time":   v.get("entry_time", ""),
+                            "order_no":     v.get("order_no", ""),
+                            # Trailing stop peaks — survive bot restart so the trail
+                            # doesn't silently reset to entry price mid-position
+                            "_trail_high":  v.get("_trail_high"),
+                            "_trail_low":   v.get("_trail_low"),
+                            "_decision_id": v.get("_decision_id"),
                         }
                         for k, v in portfolio.get("open_positions", {}).items()
                     }),
@@ -935,6 +944,9 @@ class DataManager:
                     regime_data.get("confidence", 0.0),
                     regime_data.get("suggestion", ""),
                     regime_data.get("risk_level", "medium"),
+                    # Cooldowns JSON: {"sl": {"SYMBOL": "ISO_DATETIME"}, "veto": {...}}
+                    json.dumps(portfolio.get("cooldowns", {})),
+                    portfolio.get("weekly_pnl", 0),
                 ),
             )
 
@@ -952,6 +964,10 @@ class DataManager:
                 data["open_positions"] = json.loads(data.get("open_positions", "{}"))
             except Exception:
                 data["open_positions"] = {}
+            try:
+                data["cooldowns"] = json.loads(data.get("cooldowns", "{}"))
+            except Exception:
+                data["cooldowns"] = {}
             return data
 
     def log_event(self, event_type: str, message: str, symbol: str = "", metadata: dict = None):
@@ -1214,10 +1230,6 @@ class DataManager:
                 "DELETE FROM events WHERE timestamp < datetime('now', ? || ' days')",
                 (f"-{events_days}",)
             ).rowcount
-            try:
-                conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
-            except Exception as _wal_err:
-                logger.debug(f"WAL checkpoint skipped (concurrent reader active): {_wal_err}")
         logger.info(
             f"DB cleanup: removed {tick_deleted} old ticks, {events_deleted} old events"
         )

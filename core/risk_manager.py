@@ -8,7 +8,7 @@ import os
 import logging
 from dataclasses import dataclass, field
 from typing import Optional
-from datetime import date
+from datetime import date, datetime
 
 logger = logging.getLogger(__name__)
 
@@ -16,8 +16,9 @@ logger = logging.getLogger(__name__)
 @dataclass
 class RiskConfig:
     max_capital: float           = float(os.getenv("MAX_CAPITAL", 100000))
-    max_position_size_pct: float = float(os.getenv("MAX_POSITION_SIZE_PCT", 10))
-    max_daily_loss_pct: float    = float(os.getenv("MAX_DAILY_LOSS_PCT", 3))
+    max_position_size_pct: float = float(os.getenv("MAX_POSITION_SIZE_PCT", 1.5))   # was 10 — SOP: 1.5% equity
+    max_daily_loss_pct: float    = float(os.getenv("MAX_DAILY_LOSS_PCT", 1.0))      # was 3  — SOP: 1% daily hard stop
+    max_weekly_loss_pct: float   = float(os.getenv("MAX_WEEKLY_LOSS_PCT", 2.5))     # NEW — SOP: 2.5% weekly stop
     max_open_positions: int      = int(os.getenv("MAX_OPEN_POSITIONS", 5))
     default_stop_loss_pct: float = 2.0
     default_target_pct: float    = 4.0
@@ -51,6 +52,7 @@ class RiskManager:
         self.config = config or RiskConfig()
         self.open_positions: dict = {}       # symbol -> position dict
         self.daily_pnl: float = 0.0
+        self.weekly_pnl: float = 0.0         # resets every Monday — SOP weekly hard stop
         self.daily_trades: int = 0
         self.today: date = date.today()
 
@@ -96,25 +98,49 @@ class RiskManager:
             self.daily_pnl = saved_pnl
             logger.info(f"restore_from_db: daily_pnl restored to ₹{self.daily_pnl:,.2f}")
 
+        # Restore weekly P&L — only if we're still in the same ISO week (not a new Monday)
+        saved_weekly = float(status.get("weekly_pnl", 0) or 0)
+        if saved_weekly != 0 and last_date is not None:
+            from datetime import datetime as _dt2
+            saved_week = last_date.isocalendar()[1]   # ISO week number
+            today_week = date.today().isocalendar()[1]
+            if saved_week == today_week:
+                self.weekly_pnl = saved_weekly
+                logger.info(f"restore_from_db: weekly_pnl restored to ₹{self.weekly_pnl:,.2f}")
+
+        # Restore daily_trades count so counter survives bot restarts mid-day
+        saved_trades = int(status.get("daily_trades", 0) or 0)
+        if saved_trades > 0:
+            self.daily_trades = saved_trades
+            logger.info(f"restore_from_db: daily_trades restored to {self.daily_trades}")
+
         # Restore open positions — stored as a reduced dict, reconstruct full position dict
         saved_positions = status.get("open_positions", {})
         if isinstance(saved_positions, dict) and saved_positions:
             # The stored dict has: action, entry_price, quantity, stop_loss, target, strategy
             # Add defaults for fields not stored (exchange, product, order_no, entry_time)
             for symbol, pos in saved_positions.items():
-                self.open_positions[symbol] = {
-                    "order_no":    pos.get("order_no", "RESTORED"),
-                    "symbol":      symbol,
-                    "exchange":    pos.get("exchange", "nse_cm"),
-                    "action":      pos.get("action", "BUY"),
-                    "entry_price": float(pos.get("entry_price", 0)),
-                    "quantity":    int(pos.get("quantity", 0)),
-                    "stop_loss":   float(pos.get("stop_loss", 0)),
-                    "target":      float(pos.get("target", 0)),
-                    "strategy":    pos.get("strategy", "unknown"),
-                    "product":     pos.get("product", "CNC"),
-                    "entry_time":  pos.get("entry_time", str(today)),
+                restored = {
+                    "order_no":     pos.get("order_no", "RESTORED"),
+                    "symbol":       symbol,
+                    "exchange":     pos.get("exchange", "nse_cm"),
+                    "action":       pos.get("action", "BUY"),
+                    "entry_price":  float(pos.get("entry_price", 0)),
+                    "quantity":     int(pos.get("quantity", 0)),
+                    "stop_loss":    float(pos.get("stop_loss", 0)),
+                    "target":       float(pos.get("target", 0)),
+                    "strategy":     pos.get("strategy", "unknown"),
+                    "product":      pos.get("product", "CNC"),
+                    "entry_time":   pos.get("entry_time", str(today)),
+                    "_decision_id": pos.get("_decision_id"),
                 }
+                # Restore trailing stop peaks so the trail doesn't silently reset
+                # to entry price after a restart (which causes premature SL hits)
+                if pos.get("_trail_high") is not None:
+                    restored["_trail_high"] = float(pos["_trail_high"])
+                if pos.get("_trail_low") is not None:
+                    restored["_trail_low"] = float(pos["_trail_low"])
+                self.open_positions[symbol] = restored
             logger.warning(
                 f"restore_from_db: {len(self.open_positions)} open position(s) restored "
                 f"from last save — stop-loss monitoring ACTIVE: "
@@ -139,11 +165,13 @@ class RiskManager:
 
         checks = [
             self._check_daily_loss_limit(),
+            self._check_weekly_loss_limit(),
             self._check_max_positions(signal),
             self._check_duplicate_position(signal),
             self._check_confidence(signal),
             self._check_risk_reward(signal),
             self._check_capital(signal, available_capital),
+            self._check_loss_at_stop(signal),
         ]
 
         if sector_map:
@@ -165,6 +193,31 @@ class RiskManager:
         max_loss = self.config.max_capital * (self.config.max_daily_loss_pct / 100)
         if self.daily_pnl <= -max_loss:
             return False, f"Daily loss limit hit: ₹{self.daily_pnl:.0f} / -₹{max_loss:.0f}"
+        return True, ""
+
+    def _check_weekly_loss_limit(self) -> tuple[bool, str]:
+        """SOP: 2.5% weekly hard stop — bot goes paper-only until Monday reset."""
+        max_loss = self.config.max_capital * (self.config.max_weekly_loss_pct / 100)
+        if self.weekly_pnl <= -max_loss:
+            return False, f"Weekly loss limit hit: ₹{self.weekly_pnl:.0f} / -₹{max_loss:.0f} — no new trades until Monday"
+        return True, ""
+
+    def _check_loss_at_stop(self, signal: TradeSignal) -> tuple[bool, str]:
+        """
+        SOP: Validate actual rupee loss if stop is hit — not just position notional.
+        Equity: max 1.5% capital per trade. Options (NRML): max 1% capital.
+        """
+        if signal.stop_loss <= 0 or signal.quantity <= 0:
+            return True, ""   # Can't validate without SL — other checks handle this
+        risk_per_unit = abs(signal.price - signal.stop_loss)
+        loss_at_stop = risk_per_unit * signal.quantity
+        max_pct = 1.0 if getattr(signal, "product", "CNC") == "NRML" else 1.5
+        max_loss = self.config.max_capital * max_pct / 100
+        if loss_at_stop > max_loss:
+            return False, (
+                f"Loss at stop ₹{loss_at_stop:.0f} exceeds ₹{max_loss:.0f} "
+                f"({max_pct}% of ₹{self.config.max_capital:,.0f} capital)"
+            )
         return True, ""
 
     def _check_max_positions(self, signal: TradeSignal) -> tuple[bool, str]:
@@ -364,8 +417,12 @@ class RiskManager:
         pnl = (exit_price - pos["entry_price"]) * qty
         if pos["action"] == "SELL":
             pnl = -pnl
-        self.daily_pnl += pnl
-        logger.info(f"Position closed: {symbol} P&L=₹{pnl:.0f} | Daily P&L=₹{self.daily_pnl:.0f}")
+        self.daily_pnl  += pnl
+        self.weekly_pnl += pnl   # tracks across Mon-Fri for weekly hard stop
+        logger.info(
+            f"Position closed: {symbol} P&L=₹{pnl:.0f} | "
+            f"Daily=₹{self.daily_pnl:.0f} | Weekly=₹{self.weekly_pnl:.0f}"
+        )
         return pnl
 
     def check_stop_loss_hit(self, symbol: str, current_price: float) -> bool:
@@ -393,7 +450,8 @@ class RiskManager:
         return {
             "open_positions": self.open_positions,
             "position_count": len(self.open_positions),
-            "daily_pnl": round(self.daily_pnl, 2),
+            "daily_pnl":   round(self.daily_pnl, 2),
+            "weekly_pnl":  round(self.weekly_pnl, 2),
             "daily_trades": self.daily_trades,
             "capital_at_risk": sum(
                 p["entry_price"] * p["quantity"]
@@ -427,22 +485,40 @@ class RiskManager:
         else:
             pct = self.config.trailing_stop_pct
 
+        entry = pos["entry_price"]
+
         if pos["action"] == "BUY":
-            new_stop = round(current_price * (1 - pct / 100), 2)
+            # Trail only activates once price has moved above entry (in profit territory)
+            if current_price <= entry:
+                return False
+            # Track highest price seen so far for this position
+            peak = pos.get("_trail_high", entry)
+            if current_price > peak:
+                pos["_trail_high"] = current_price
+                peak = current_price
+            new_stop = round(peak * (1 - pct / 100), 2)
             if new_stop > pos["stop_loss"]:
                 logger.info(
                     f"Trailing stop: {symbol} SL {pos['stop_loss']} → {new_stop}"
-                    f" (price ₹{current_price})"
+                    f" (price ₹{current_price}, peak ₹{peak})"
                 )
                 pos["stop_loss"] = new_stop
                 return True
 
-        else:  # SELL / short
-            new_stop = round(current_price * (1 + pct / 100), 2)
+        else:  # SELL / short — profit when premium FALLS below entry
+            # Trail only activates once price has fallen below entry (in profit territory)
+            if current_price >= entry:
+                return False
+            # Track lowest price seen so far for this position
+            trough = pos.get("_trail_low", entry)
+            if current_price < trough:
+                pos["_trail_low"] = current_price
+                trough = current_price
+            new_stop = round(trough * (1 + pct / 100), 2)
             if new_stop < pos["stop_loss"]:
                 logger.info(
                     f"Trailing stop: {symbol} SL {pos['stop_loss']} → {new_stop}"
-                    f" (price ₹{current_price})"
+                    f" (price ₹{current_price}, trough ₹{trough})"
                 )
                 pos["stop_loss"] = new_stop
                 return True

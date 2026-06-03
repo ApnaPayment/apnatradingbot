@@ -53,7 +53,7 @@ When evaluating a trade signal:
 1. Verify the technical setup is clean and unambiguous
 2. Check portfolio context — avoid correlated positions, sector concentration
 3. Assess macro headwinds/tailwinds relevant to the stock
-4. Confirm risk:reward is acceptable (minimum 1:2)
+4. Confirm risk:reward is acceptable (minimum 1:2). EXCEPTION: for SELL NRML (short option writing / premium selling), the structural R:R is 0.7:1 (target=70% decay, stop=100% rise). This is intentional and correct for theta-decay strategies — do NOT veto on R:R alone for SELL+NRML signals.
 5. Consider liquidity — can the quantity be filled without slippage?
 6. Flag any upcoming events (results, ex-dividend, bonus record date) that could spike volatility
 

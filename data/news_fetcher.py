@@ -75,7 +75,7 @@ class NewsFetcher:
                 for index in data.get("data", []):
                     if index.get("index") == "INDIA VIX":
                         vix = float(index.get("last", 0))
-                        self._set_cache("india_vix", vix, ttl=300)
+                        self._set_cache("india_vix", vix, ttl=900)  # 15 min — VIX doesn't need per-cycle refresh
                         logger.info(f"India VIX: {vix:.2f}")
                         return vix
                 # Data returned but VIX row missing — force cookie refresh and retry

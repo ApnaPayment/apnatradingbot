@@ -143,11 +143,24 @@ class OptionsStrategy:
     # Public interface
     # ─────────────────────────────────────────────────────────────────────────
 
-    def generate_signal(self, data_manager) -> Optional[TradeSignal]:
+    def generate_signal(self, data_manager, vix: float = None) -> Optional[TradeSignal]:
         """
         Scan for an options entry opportunity.
         Returns a TradeSignal (product=NRML, exchange=nse_fo) or None.
+
+        Args:
+            vix: Current India VIX value. If > 20 (elevated vol), options entry is blocked
+                 per SOP — high VIX means gamma risk is unacceptably elevated.
         """
+        # SOP: Block new short options when VIX is elevated (>20)
+        # Theta income requires a stable vol environment; spikes indicate gap risk
+        if vix is not None and vix > 20:
+            logger.info(
+                f"Options [{self.underlying}]: VIX={vix:.1f} > 20 — "
+                f"skipping (elevated vol, gamma risk unacceptable)"
+            )
+            return None
+
         # Step 1: Get OHLCV for trend detection.
         # Prefer ETF proxy; fall back to index symbol if no ETF available (FINNIFTY, MIDCPNIFTY).
         ohlcv_symbol  = self.etf_symbol or self.underlying

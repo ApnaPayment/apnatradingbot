@@ -11,8 +11,9 @@ import time
 import logging
 import threading
 import schedule
-from datetime import datetime, date
+from datetime import datetime, date, time as dtime
 from dotenv import load_dotenv
+from enum import Enum
 from pathlib import Path
 
 # Always load .env from the project root regardless of working directory
@@ -131,6 +132,22 @@ WATCHLIST = [
 OPTIONS_ETF_PROXIES = ["NIFTYBEES-EQ", "BANKBEES-EQ", "HDFCSENSEX-EQ", "ITBEES-EQ"]
 
 
+class TradingMode(Enum):
+    """
+    SOP daily trading mode — set in job_daily_setup() based on VIX, regime, calendar risk.
+    Also escalated by circuit breaker on intraday loss thresholds.
+
+    NORMAL:    Full trading, full size, all strategies.
+    CAUTION:   Half size, no new short options. Triggered by VIX 20-25 or CB CAUTION.
+    DEFENSIVE: Exits only + at most 1 high-conviction equity signal. VIX > 25 or extreme event.
+    NO_TRADE:  No new entries whatsoever. CB HALT/CLOSE, major event risk, data/broker failure.
+    """
+    NORMAL    = "normal"
+    CAUTION   = "caution"
+    DEFENSIVE = "defensive"
+    NO_TRADE  = "no_trade"
+
+
 class AlgoTrader:
     """Main bot orchestrator."""
 
@@ -182,10 +199,13 @@ class AlgoTrader:
         self._cycle_lock     = threading.Lock()  # prevent overlapping trading cycles
         self._market_regime  = "unknown"
         self._regime_data    = {}       # Full AI regime dict (regime + confidence + suggestion)
-        self.trading_paused  = False    # Set True by morning brief if conditions are extreme
+        self.trading_paused  = False           # Legacy flag — kept for backward compat; use _trading_mode
+        self._trading_mode   = TradingMode.NORMAL  # SOP daily mode (NORMAL/CAUTION/DEFENSIVE/NO_TRADE)
         self._calendar_ctx   = {}       # Refreshed once per trading cycle
         self._session_vetoes: set[str] = set()   # Phase 10: operator-blocked symbols
         self._sl_cooldown: dict[str, datetime] = {}  # symbol → time SL was hit; blocks re-entry
+        self._veto_cooldown: dict[str, datetime] = {}  # symbol → last veto time; suppresses signal spam
+        self._setup_done_date: date = None  # track if job_daily_setup already ran today
         self._cmd_handler    = None     # Phase 10: Telegram command handler (started in startup)
         # ── Session-level stats (reset on bot start, used by /status and EOD report) ──
         import datetime as _dt
@@ -261,6 +281,7 @@ class AlgoTrader:
         # Without this, a restart zeros daily_pnl (bypasses loss limit) and loses
         # all open position references (no stop-loss monitoring after crash/restart).
         self.risk.restore_from_db(self.data)
+        self._restore_cooldowns()  # Restore SL/veto cooldowns so signal spam protection survives restart
 
         # Mark bot as running in DB — sleep 3s first so any prior process shutdown
         # (which writes "stopped") completes before we overwrite with "running"
@@ -410,8 +431,8 @@ class AlgoTrader:
         if not self.is_market_open():
             return
 
-        if self.trading_paused:
-            logger.warning("Trading paused by morning AI brief — skipping cycle")
+        if self.trading_paused or self._trading_mode == TradingMode.NO_TRADE:
+            logger.warning(f"Trading paused (mode={self._trading_mode.value}) — skipping cycle")
             return
 
         logger.info("─── Trading cycle started ───")
@@ -494,6 +515,12 @@ class AlgoTrader:
                               "effective_loss": cb_status.effective_loss},
                 )
 
+            # SOP: Sync trading mode with circuit breaker state
+            if cb_status.state == CBState.CAUTION and self._trading_mode == TradingMode.NORMAL:
+                self._trading_mode = TradingMode.CAUTION
+            elif cb_status.state in (CBState.HALT, CBState.CLOSE):
+                self._trading_mode = TradingMode.NO_TRADE
+
             if cb_status.force_close:
                 logger.warning("Circuit breaker CLOSE — force-closing all positions")
                 self.trading_paused = True
@@ -513,6 +540,9 @@ class AlgoTrader:
             # Detect market regime — local technical analysis as base,
             # then upgrade with AI reasoning if ANTHROPIC_API_KEY is set.
             local_regime = self.data.detect_regime("NIFTYBEES-EQ")
+            # Never overwrite a valid regime with "unknown" — preserve last known state
+            if local_regime == "unknown" and self._market_regime != "unknown":
+                local_regime = self._market_regime
             try:
                 nifty_quote = self.data.get_live_quote("NIFTYBEES-EQ") or {}
                 # Enrich quote with OHLCV-derived context so AI has real data
@@ -524,22 +554,27 @@ class AlgoTrader:
                     nifty_quote["ltp"]        = _cur
                     nifty_quote["local_regime"] = local_regime
                 ai_regime   = self.ai.detect_market_regime(nifty_quote)
+                new_regime = ai_regime.get("regime", "unknown")
                 # AI result is authoritative only when confidence > local (0.6+).
                 # If AI says ranging at exactly 50% but local says trending, trust local.
-                if ai_regime.get("confidence", 0) > 0.6:
-                    self._market_regime = ai_regime["regime"]
+                # Never update to "unknown" — keep last valid regime.
+                if new_regime != "unknown" and ai_regime.get("confidence", 0) > 0.6:
+                    self._market_regime = new_regime
                     self._regime_data   = ai_regime
-                else:
+                elif local_regime != "unknown":
                     self._market_regime = local_regime
                     self._regime_data   = {"regime": local_regime, "confidence": 0.65,
                                            "suggestion": "Local technical regime (AI low-confidence)",
                                            "risk_level": "medium"}
+                # else: both are "unknown" — keep current self._market_regime unchanged
             except Exception as e:
                 logger.warning(f"AI regime detection failed, using local: {e}")
-                self._market_regime = local_regime
-                self._regime_data   = {"regime": local_regime, "confidence": 0.65,
-                                       "suggestion": "AI unavailable — local regime used",
-                                       "risk_level": "medium"}
+                if local_regime != "unknown":
+                    self._market_regime = local_regime
+                    self._regime_data   = {"regime": local_regime, "confidence": 0.65,
+                                           "suggestion": "AI unavailable — local regime used",
+                                           "risk_level": "medium"}
+                # else keep existing regime if local is also unknown
             logger.info(
                 f"Market regime: {self._market_regime}"
                 f" (conf={self._regime_data.get('confidence', 0):.0%},"
@@ -548,6 +583,8 @@ class AlgoTrader:
 
             # Update bot status in DB (includes regime from above — dashboard sees it immediately)
             portfolio = self.risk.get_portfolio_summary()
+            # Persist cooldowns so they survive a mid-day restart
+            portfolio["cooldowns"] = self._serialise_cooldowns()
             try:
                 self.data.update_bot_status(
                     portfolio,
@@ -569,15 +606,50 @@ class AlgoTrader:
                 self.telegram.alert_error(str(e), "signal_aggregation")
                 signals = []
 
+            # DEFENSIVE mode: exits only — suppress all new equity signals
+            if self._trading_mode == TradingMode.DEFENSIVE:
+                logger.info(f"Mode=DEFENSIVE — no new equity signals (exits only)")
+                signals = []
+
             # F&O options — enter when regime is trending (local or AI-detected)
             _local_regime = self.data.detect_regime("NIFTYBEES-EQ")
-            logger.info(f"Regime check — AI: {self._market_regime} | Local: {_local_regime}")
+            logger.info(
+                f"Regime check — AI: {self._market_regime} | Local: {_local_regime} | "
+                f"Mode: {self._trading_mode.value}"
+            )
             _run_options = (self._market_regime in ("trending_up", "trending_down") or
                             _local_regime in ("trending_up", "trending_down"))
+            # CAUTION/DEFENSIVE: no new short options (gamma risk too high)
+            if self._trading_mode in (TradingMode.CAUTION, TradingMode.DEFENSIVE):
+                _run_options = False
+                logger.info(f"Mode={self._trading_mode.value} — options signals suppressed")
+            # Stop generating new options signals after 15:00 — premiums are illiquid
+            # and wide bid-ask spreads cause guaranteed bad fills in the last 30 min
+            _now = datetime.now().time()
+            if _now >= dtime(15, 0):
+                _run_options = False
+                logger.debug("Options signal generation disabled after 15:00")
             if _run_options:
+                # Build set of underlyings already in open positions (NRML) to avoid
+                # generating duplicate signals for strikes/underlyings already held
+                _held_underlyings = set()
+                for _sym, _pos in self.risk.open_positions.items():
+                    if _pos.get("product") == "NRML":
+                        # Extract underlying: "NIFTY2660923400CE" → "NIFTY"
+                        import re as _re_opt
+                        _m = _re_opt.match(r'^([A-Z]+)', _sym)
+                        if _m:
+                            _held_underlyings.add(_m.group(1))
                 for opt_strat in self.options_strategies:
+                    # Skip if already holding a position on this underlying (same direction)
+                    if opt_strat.underlying in _held_underlyings:
+                        logger.debug(
+                            f"Options: skipping {opt_strat.underlying} — already have open NRML position"
+                        )
+                        continue
                     try:
-                        opt_signal = opt_strat.generate_signal(self.data)
+                        _vix = self.news.get_india_vix()   # cached 15-min TTL
+                        opt_signal = opt_strat.generate_signal(self.data, vix=_vix)
                         if opt_signal:
                             signals.append(opt_signal)
                     except Exception as e:
@@ -639,6 +711,18 @@ class AlgoTrader:
                 logger.info(
                     f"SL cooldown: {signal.symbol} blocked for "
                     f"{self._SL_COOLDOWN_MINUTES - _mins_since:.0f} more min after SL"
+                )
+                return
+
+        # Veto cooldown — suppress re-generated signals for 15 min after a veto
+        # Prevents the same symbol/strike from burning API calls every 5-min cycle
+        _veto_hit_at = self._veto_cooldown.get(signal.symbol)
+        if _veto_hit_at:
+            _veto_mins = (datetime.now() - _veto_hit_at).total_seconds() / 60
+            if _veto_mins < 15:
+                logger.debug(
+                    f"Veto cooldown: {signal.symbol} suppressed for "
+                    f"{15 - _veto_mins:.0f} more min"
                 )
                 return
 
@@ -904,6 +988,9 @@ class AlgoTrader:
                 "vetoed_at":   _ltp or signal.price,
                 "good_veto":   None,
             })
+
+            # Suppress this exact symbol from re-generating for 15 min
+            self._veto_cooldown[signal.symbol] = datetime.now()
             return
 
         self._ai_approved += 1
@@ -980,9 +1067,92 @@ class AlgoTrader:
         self.dashboard.log_signal(signal, reasoning[:60])
         self._execute_trade(signal)
 
+    def _pre_execution_check(self, signal: TradeSignal) -> tuple[bool, str]:
+        """
+        SOP Execution Gate: Re-fetch live quote immediately before placing order.
+        Blocks if quote is stale or LTP has moved too far from signal price.
+        - Options (NRML): max quote age 5s, max slippage 2%
+        - Equity (CNC):   max quote age 30s, max slippage 0.5%
+        Paper trading always passes (quotes are delayed).
+        """
+        if self.client.paper_trading:
+            return True, ""   # paper mode: quotes are delayed, skip freshness gate
+
+        try:
+            quote = self.data.get_live_quote(signal.symbol, signal.exchange)
+            if not quote:
+                return False, f"No live quote for {signal.symbol} at execution time"
+
+            # Quote age check
+            ts = quote.get("timestamp") or quote.get("ltt")
+            if ts:
+                try:
+                    import pandas as _pd
+                    age = (datetime.now() - _pd.Timestamp(ts).to_pydatetime().replace(tzinfo=None)).total_seconds()
+                    max_age = 5 if signal.product == "NRML" else 30
+                    if age > max_age:
+                        return False, f"Quote stale {age:.0f}s > {max_age}s limit for {signal.symbol}"
+                except Exception:
+                    pass  # timestamp parsing failure — don't block
+
+            # Slippage check: LTP vs signal price
+            ltp = float(quote.get("ltp") or quote.get("last_price") or 0)
+            if ltp > 0 and signal.price > 0:
+                slippage = abs(ltp - signal.price) / signal.price
+                max_slip = 0.02 if signal.product == "NRML" else 0.005
+                if slippage > max_slip:
+                    return False, (
+                        f"{signal.symbol} LTP ₹{ltp:.2f} moved {slippage:.1%} "
+                        f"from signal ₹{signal.price:.2f} (limit {max_slip:.1%})"
+                    )
+        except Exception as e:
+            logger.warning(f"Pre-execution check error (non-blocking): {e}")
+            return True, ""   # fail open on check errors — don't block live trades on a bug
+
+        return True, ""
+
+    def _confirm_fill(self, order_no: str, paper: bool = False,
+                      max_attempts: int = 3) -> tuple[bool, float]:
+        """
+        SOP: Poll order book to confirm fill before recording position.
+        Returns (filled: bool, fill_price: float).
+        Paper trades are always considered filled at signal price.
+        """
+        if paper:
+            return True, 0.0   # paper: position recorded at signal price
+
+        import time as _t
+        for attempt in range(max_attempts):
+            if attempt > 0:
+                _t.sleep(2)
+            try:
+                book = self.client.get_order_book()
+                for order in (book.get("data") or []):
+                    if str(order.get("nOrdNo")) == str(order_no):
+                        status = str(order.get("ordSt", "")).lower()
+                        if status in ("complete", "traded", "filled"):
+                            fill_price = float(order.get("avgPrc") or order.get("prc") or 0)
+                            logger.info(f"Fill confirmed: {order_no} @ ₹{fill_price:.2f}")
+                            return True, fill_price
+                        if status in ("rejected", "cancelled"):
+                            logger.warning(f"Order {order_no} {status}: {order.get('rejRsn', '')}")
+                            return False, 0.0
+                        # status = open/pending — keep polling
+            except Exception as e:
+                logger.warning(f"Fill check attempt {attempt+1}: {e}")
+        logger.warning(f"Fill confirmation timeout for {order_no} — treating as unconfirmed")
+        return False, 0.0
+
     def _execute_trade(self, signal: TradeSignal):
         """Place the order via Kotak Neo API."""
         try:
+            # SOP: pre-execution gate — quote freshness + slippage validation
+            ok, reason = self._pre_execution_check(signal)
+            if not ok:
+                logger.warning(f"Pre-execution BLOCKED [{signal.symbol}]: {reason}")
+                self.data.log_event("BLOCKED", reason, symbol=signal.symbol)
+                return
+
             result = self.client.place_order(
                 symbol=signal.symbol,
                 exchange=signal.exchange,
@@ -999,6 +1169,23 @@ class AlgoTrader:
 
             if stat == "Ok" or result.get("paper"):
                 logger.info(f"Order placed: {signal.symbol} | Order No: {order_no}")
+
+                # SOP: confirm fill before recording position (paper always passes)
+                filled, fill_price = self._confirm_fill(
+                    order_no, paper=bool(result.get("paper"))
+                )
+                if not filled and not result.get("paper"):
+                    logger.error(
+                        f"Fill unconfirmed for {order_no} ({signal.symbol}) — "
+                        f"position NOT recorded. Manual review required."
+                    )
+                    self.data.log_event("UNCONFIRMED_FILL", signal.symbol, symbol=signal.symbol)
+                    self.telegram.alert_error(
+                        f"Order {order_no} for {signal.symbol} placed but fill unconfirmed",
+                        f"fill_check_{signal.symbol}"
+                    )
+                    return
+
                 self.risk.record_entry(signal, order_no)  # _decision_id saved inside record_entry
                 if signal.product == "NRML":
                     # F&O entry — send rich options alert
@@ -1073,6 +1260,12 @@ class AlgoTrader:
         positions = portfolio.get("open_positions", {})
 
         for symbol, pos in list(positions.items()):
+            # NRML (options) positions have their own dedicated monitor (_monitor_fo_positions).
+            # Letting them through the equity trailing-stop logic causes premature exits because
+            # a 1.5–15% trail on a ₹150–200 option fires on normal bid-ask noise.
+            if pos.get("product") == "NRML":
+                continue
+
             quote = self.data.get_live_quote(symbol, pos.get("exchange", "nse_cm"))
             if not quote:
                 continue
@@ -1340,6 +1533,10 @@ class AlgoTrader:
             )
             pnl = self.risk.record_exit(symbol, exit_price)
 
+            # SOP: pattern-based circuit breaker — record loss for 30-min window
+            if (pnl or 0) < 0:
+                self.cb.record_loss()
+
             self.data.record_trade({
                 "symbol":      pos["symbol"],
                 "exchange":    "nse_fo",
@@ -1415,6 +1612,10 @@ class AlgoTrader:
 
             pnl = self.risk.record_exit(symbol, exit_price)
 
+            # SOP: pattern-based circuit breaker — record loss for 30-min window detection
+            if (pnl or 0) < 0:
+                self.cb.record_loss()
+
             # Link outcome back to the AI decision row
             decision_id = pos.get("_decision_id")
             if decision_id:
@@ -1468,16 +1669,135 @@ class AlgoTrader:
             logger.error(f"Exit position error for {symbol}: {e}")
 
     # ─────────────────────────────────────────────────────────────────────────
+    # EOD Reconciliation — SOP: broker vs DB position audit
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def _reconcile_positions(self):
+        """
+        SOP: Compare DB open positions vs broker trade/position book at EOD.
+        Detects two dangerous states:
+          - Phantom:   position in DB but closed/absent in broker → clear from DB
+          - Untracked: position in broker but absent in DB → alert, requires manual exit
+        Called from job_market_close() before EOD summary.
+        """
+        db_syms = set(self.risk.open_positions.keys())
+
+        if not db_syms and not True:   # Skip if nothing to reconcile
+            return
+
+        try:
+            # Fetch broker positions (works in paper mode too — returns empty list)
+            broker_response = self.client.get_positions()
+            broker_data     = broker_response.get("data") or [] if isinstance(broker_response, dict) else []
+            # Build set of symbols with net non-zero quantity in broker
+            broker_syms = set()
+            for pos in broker_data:
+                sym = pos.get("trdSym") or pos.get("sym") or pos.get("symbol", "")
+                qty = int(pos.get("netQty") or pos.get("qty") or 0)
+                if sym and qty != 0:
+                    broker_syms.add(sym)
+
+            phantoms   = db_syms - broker_syms   # in DB but not broker
+            untracked  = broker_syms - db_syms   # in broker but not DB
+
+            if phantoms:
+                for sym in phantoms:
+                    logger.error(f"ORPHAN DB: {sym} is in DB but absent in broker — removing")
+                    self.data.log_event("ORPHAN_DB", f"{sym} in DB not broker", sym)
+                    self.risk.open_positions.pop(sym, None)
+                self.telegram.send(
+                    f"⚠️ <b>Reconciliation:</b> {len(phantoms)} phantom position(s) cleared from DB: "
+                    f"{', '.join(phantoms)}"
+                )
+
+            if untracked:
+                for sym in untracked:
+                    logger.critical(f"ORPHAN BROKER: {sym} exists in broker but not DB — manual exit needed")
+                    self.data.log_event("ORPHAN_BROKER", f"{sym} in broker not DB", sym)
+                self.telegram.send(
+                    f"🚨 <b>UNTRACKED POSITIONS</b> — manual exit required:\n"
+                    f"{', '.join(untracked)}"
+                )
+
+            if not phantoms and not untracked:
+                logger.info(f"Reconciliation: {len(db_syms)} DB position(s) match broker ✓")
+
+        except Exception as e:
+            logger.error(f"Reconciliation error (non-critical): {e}")
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Cooldown persistence helpers
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def _serialise_cooldowns(self) -> dict:
+        """Convert in-memory cooldown dicts to ISO strings for DB storage."""
+        return {
+            "sl":   {sym: dt.isoformat() for sym, dt in self._sl_cooldown.items()},
+            "veto": {sym: dt.isoformat() for sym, dt in self._veto_cooldown.items()},
+        }
+
+    def _restore_cooldowns(self) -> None:
+        """Load cooldowns saved at last cycle so signal-spam protection survives restart."""
+        try:
+            status = self.data.get_bot_status()
+        except Exception as e:
+            logger.warning(f"restore_cooldowns: could not read bot_status: {e}")
+            return
+        cooldowns = status.get("cooldowns", {})
+        if not cooldowns:
+            return
+        # Only restore cooldowns that are still within their window (< 30 min old)
+        _now = datetime.now()
+        _max_age = 30 * 60  # 30 minutes in seconds
+        restored_sl, restored_veto = 0, 0
+        for sym, iso in cooldowns.get("sl", {}).items():
+            try:
+                dt = datetime.fromisoformat(iso)
+                if (_now - dt).total_seconds() < _max_age:
+                    self._sl_cooldown[sym] = dt
+                    restored_sl += 1
+            except Exception:
+                pass
+        for sym, iso in cooldowns.get("veto", {}).items():
+            try:
+                dt = datetime.fromisoformat(iso)
+                if (_now - dt).total_seconds() < _max_age:
+                    self._veto_cooldown[sym] = dt
+                    restored_veto += 1
+            except Exception:
+                pass
+        if restored_sl or restored_veto:
+            logger.info(
+                f"Cooldowns restored: {restored_sl} SL cooldown(s), "
+                f"{restored_veto} veto cooldown(s) still active"
+            )
+
+    # ─────────────────────────────────────────────────────────────────────────
     # Scheduled jobs
     # ─────────────────────────────────────────────────────────────────────────
 
     def job_daily_setup(self):
-        """Run at 8:45 AM before market opens — weekdays only."""
+        """Run at 8:45 AM before market opens — weekdays only.
+        Skips if already ran today to prevent re-running on afternoon restarts,
+        which would trigger massive DB writes that conflict with the liquidity engine."""
         if datetime.now().weekday() >= 5:
             return
+        today = date.today()
+        if self._setup_done_date == today:
+            logger.info("Daily setup already completed today — skipping (restart mid-day)")
+            return
+        self._setup_done_date = today
         logger.info("Running daily setup...")
-        self.trading_paused = False  # Reset any previous day's pause
-        self.cb.reset_for_new_day()  # Phase 13: reset circuit breaker state
+        self.trading_paused  = False                  # Reset any previous day's pause
+        self._trading_mode   = TradingMode.NORMAL     # Reset to full trading mode each day
+        self.cb.reset_for_new_day()                   # Reset circuit breaker state
+        self._veto_cooldown.clear()                   # Reset veto cooldowns for new trading day
+        self._sl_cooldown.clear()                     # Reset SL cooldowns for new trading day
+
+        # SOP: Reset weekly P&L counter on Monday — fresh week, fresh loss budget
+        if datetime.now().weekday() == 0:   # Monday = 0
+            self.risk.weekly_pnl = 0.0
+            logger.info("Weekly P&L counter reset (Monday)")
 
         # Send market-open alert once per day at 8:45 AM
         _today_flag = Path(__file__).parent / f"logs/.market_open_{datetime.now().date()}"
@@ -1547,10 +1867,22 @@ class AlgoTrader:
                 f"Morning brief — bias={bias}, caution={caution}: {reason}"
             )
 
+            # SOP: Set daily trading mode based on VIX + calendar risk
+            if vix is not None:
+                if vix > 25:
+                    self._trading_mode = TradingMode.DEFENSIVE
+                    logger.warning(f"Daily mode → DEFENSIVE (VIX={vix:.1f} > 25)")
+                elif vix > 20:
+                    self._trading_mode = TradingMode.CAUTION
+                    logger.info(f"Daily mode → CAUTION (VIX={vix:.1f} > 20)")
+                else:
+                    self._trading_mode = TradingMode.NORMAL
+
             # Hard pause on event day (RBI/Budget) — override AI brief
             if any(ev.get("days_away") == 0
                    for ev in self._calendar_ctx.get("economic_events_14d", [])):
                 self.trading_paused = True
+                self._trading_mode  = TradingMode.NO_TRADE
                 event_names = ", ".join(
                     ev["label"] for ev in self._calendar_ctx["economic_events_14d"]
                     if ev.get("days_away") == 0
@@ -1562,6 +1894,7 @@ class AlgoTrader:
 
             if brief.get("avoid_trading"):
                 self.trading_paused = True
+                self._trading_mode  = TradingMode.NO_TRADE
                 msg = (
                     f"⛔ <b>AI Morning Brief — TRADING PAUSED</b>\n\n"
                     f"Reason: {reason}\n"
@@ -1650,6 +1983,9 @@ class AlgoTrader:
                 trade_list, portfolio.get("open_positions", {})
             )
             logger.info(f"\n{report}")
+
+        # SOP: Reconcile broker vs DB positions before EOD summary
+        self._reconcile_positions()
 
         self._assess_veto_outcomes()
         ai_advice     = self.ai.get_portfolio_advice(portfolio)

@@ -241,6 +241,22 @@ def get_liq_today_stats() -> dict:
             "mcx_trades": 0, "bse_trades": 0}
 
 
+def get_liq_decisions(limit: int = 50) -> pd.DataFrame:
+    """Fetch recent Liquidity Engine AI decisions (MCX/BSE signals, approved + vetoed)."""
+    with get_conn() as conn:
+        try:
+            return pd.read_sql_query(
+                """SELECT decided_at, symbol, exchange, action, approved,
+                          veto_reason, ai_reasoning, signal_price, stop_loss,
+                          target, outcome, outcome_pnl
+                   FROM liq_ai_decisions
+                   ORDER BY id DESC LIMIT ?""",
+                conn, params=(limit,)
+            )
+        except Exception:
+            return pd.DataFrame()
+
+
 def get_ai_decisions(limit: int = 200, symbol: str = None) -> pd.DataFrame:
     """Fetch AI decision history (both approved and vetoed) for chart markers."""
     with get_conn() as conn:

@@ -161,6 +161,30 @@ class LiquidityEngine:
         self.db.update_bot_status(status="starting", segments_active=self.segments)
         logger.info("Liquidity Engine initialised")
 
+    # ─── Position persistence ─────────────────────────────────────────────────
+
+    def _persist_positions(self):
+        """Save both risk managers' open positions to DB immediately."""
+        all_positions = {**self.risk.open_positions, **self.mcx_risk.open_positions}
+        self.db.update_bot_status(open_positions=all_positions)
+
+    def _restore_positions(self):
+        """Restore open positions from DB into the correct risk manager on startup."""
+        status = self.db.get_bot_status()
+        saved = status.get("open_positions", {})
+        if not saved:
+            return
+        restored = 0
+        for symbol, pos in saved.items():
+            exchange = pos.get("exchange", "")
+            if exchange == "mcx_fo":
+                self.mcx_risk.open_positions[symbol] = pos
+            else:
+                self.risk.open_positions[symbol] = pos
+            restored += 1
+        if restored:
+            logger.info(f"LiqRestore: {restored} open position(s) restored from DB: {list(saved.keys())}")
+
     # ─── Market hours check ──────────────────────────────────────────────────
 
     def _is_market_open(self, segment: str = "bse_cm") -> bool:
@@ -239,7 +263,7 @@ class LiquidityEngine:
                 f"Capital: ₹{LIQ_MAX_CAPITAL:,.0f} | Max positions: {LIQ_MAX_POSITIONS}\n"
                 f"Calendar: {cal.get('risk_level','normal').upper()}"
             )
-            self.telegram.send_message(msg)
+            self.telegram.send(msg)
         except Exception:
             pass
 
@@ -465,6 +489,9 @@ class LiquidityEngine:
             f"Strategy: {signal.strategy}"
         )
 
+        # Persist positions to DB immediately so a restart doesn't lose this trade
+        self._persist_positions()
+
         try:
             msg = (
                 f"[LIQ] 📊 PAPER {signal.action} — {signal.symbol}\n"
@@ -473,7 +500,7 @@ class LiquidityEngine:
                 f"SL: ₹{signal.stop_loss:.2f} | Target: ₹{signal.target:.2f}\n"
                 f"Strategy: {signal.strategy} | Conf: {signal.confidence:.0%}"
             )
-            self.telegram.send_message(msg)
+            self.telegram.send(msg)
         except Exception:
             pass
 
@@ -512,13 +539,15 @@ class LiquidityEngine:
             f"[LIQ] EXIT {symbol} @ ₹{exit_price:.2f} "
             f"| P&L: ₹{pnl:+.2f} | Reason: {reason}"
         )
+        self._persist_positions()
+
         try:
             msg = (
                 f"[LIQ] {sign} EXIT {symbol}\n"
                 f"Price: ₹{exit_price:.2f} | P&L: ₹{pnl:+.2f}\n"
                 f"Reason: {reason} | Day P&L: ₹{self.risk.daily_pnl:+.2f}"
             )
-            self.telegram.send_message(msg)
+            self.telegram.send(msg)
         except Exception:
             pass
 
@@ -628,7 +657,7 @@ class LiquidityEngine:
         if signals:
             logger.info(f"LiqMCX: {len(signals)} signal(s) from {len(MCX_WATCHLIST)} commodities")
         else:
-            logger.debug(f"LiqMCX: no signals this cycle ({len(MCX_WATCHLIST)} commodities scanned)")
+            logger.info(f"LiqMCX: no signals this cycle ({len(MCX_WATCHLIST)} commodities scanned)")
 
         for sig in signals:
             self._process_signal(sig)
@@ -687,13 +716,15 @@ class LiquidityEngine:
             f"[LIQ] EXIT MCX {commodity} @ ₹{exit_price:.2f} "
             f"| P&L: ₹{pnl:+.2f} | Reason: {reason}"
         )
+        self._persist_positions()
+
         try:
             msg = (
                 f"[LIQ] {sign} EXIT MCX {commodity}\n"
                 f"Price: ₹{exit_price:.2f} | P&L: ₹{pnl:+.2f}\n"
                 f"Reason: {reason} | Day P&L: ₹{self.mcx_risk.daily_pnl:+.2f}"
             )
-            self.telegram.send_message(msg)
+            self.telegram.send(msg)
         except Exception:
             pass
 
@@ -735,7 +766,7 @@ class LiquidityEngine:
                 f"Day P&L: ₹{stats['total_pnl']:+.2f}\n"
                 f"Segments: {', '.join(self.segments)}"
             )
-            self.telegram.send_message(msg)
+            self.telegram.send(msg)
         except Exception:
             pass
 
@@ -769,6 +800,16 @@ class LiquidityEngine:
             self.run_trading_cycle()
             self.db.update_bot_status(status="stopped")
             return
+
+        # Restore any open positions from DB before running daily setup
+        # (daily setup resets daily_pnl/trades but must NOT wipe positions)
+        self._restore_positions()
+
+        # Always run daily setup on startup (bootstrap data, reset counters).
+        # Without this, a restart after 08:45 skips bootstrap entirely — OHLCV cache
+        # is empty and strategies have no data to work with.
+        logger.info("[LIQ] Running startup bootstrap (daily setup)...")
+        self.job_daily_setup()
 
         while self._running:
             schedule.run_pending()

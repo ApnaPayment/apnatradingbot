@@ -22,7 +22,7 @@ State is reset to NORMAL at the start of each trading day.
 import logging
 import os
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from enum import Enum
 from typing import Optional
 
@@ -87,11 +87,16 @@ class CircuitBreaker:
         # Pass cb_status.size_multiplier to calculate_quantity()
     """
 
+    # SOP: pattern-based loss detection (independent of % loss threshold)
+    _LOSS_WINDOW_MINUTES = 30
+    _LOSS_WINDOW_HALT    = 5    # 5 losses in 30 min → force HALT
+
     def __init__(self, config: CircuitBreakerConfig = None):
         self.config = config or CircuitBreakerConfig()
         self._state          = CBState.NORMAL
         self._triggered_at: Optional[str] = None
         self._last_day: Optional[str] = None   # date string — for daily reset
+        self._loss_timestamps: list = []        # recent losing trade timestamps
 
     # ─────────────────────────────────────────────────────────────────────
     # Public API
@@ -99,9 +104,35 @@ class CircuitBreaker:
 
     def reset_for_new_day(self):
         """Call at start of each trading day (job_daily_setup)."""
-        self._state        = CBState.NORMAL
-        self._triggered_at = None
+        self._state           = CBState.NORMAL
+        self._triggered_at    = None
+        self._loss_timestamps = []
         logger.info("Circuit breaker reset for new day → NORMAL")
+
+    def record_loss(self, ts: datetime = None) -> None:
+        """
+        Call after every losing trade closes.
+        Maintains a 30-minute sliding window of loss events.
+        If 5+ losses occur within 30 min, circuit breaker escalates to HALT.
+        """
+        ts = ts or datetime.now()
+        self._loss_timestamps.append(ts)
+        # Trim to sliding window
+        cutoff = ts - timedelta(minutes=self._LOSS_WINDOW_MINUTES)
+        self._loss_timestamps = [t for t in self._loss_timestamps if t >= cutoff]
+
+        n = len(self._loss_timestamps)
+        if n >= self._LOSS_WINDOW_HALT:
+            prev = self._state
+            state_order = [CBState.NORMAL, CBState.CAUTION, CBState.HALT, CBState.CLOSE]
+            halt_idx = state_order.index(CBState.HALT)
+            if state_order.index(self._state) < halt_idx:
+                self._state        = CBState.HALT
+                self._triggered_at = ts.isoformat()
+                logger.warning(
+                    f"Circuit breaker: {prev.value} → HALT "
+                    f"(pattern: {n} losses in {self._LOSS_WINDOW_MINUTES} min)"
+                )
 
     def check(self,
               realised_pnl: float,

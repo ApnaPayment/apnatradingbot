@@ -164,9 +164,14 @@ class CommodityStrategy:
             logger.debug(f"MCX {commodity}: ADX {adx:.1f} < {self.adx_threshold} (weak trend)")
             return None
 
-        # ── Check for recent EMA crossover (within last 3 bars) ───────────────
-        recent_cross_above = any(df["cross_above"].iloc[-3:])
-        recent_cross_below = any(df["cross_below"].iloc[-3:])
+        # ── EMA alignment: is EMA20 currently above EMA50? ───────────────────────
+        # We use trend ALIGNMENT (EMA20 > EMA50) rather than requiring a fresh crossover.
+        # Requiring a crossover within N bars misses established trends — CRUDEOIL can trend
+        # for a week after the initial cross, and we want to capture that entire move.
+        ema_fast_val = float(latest["ema_fast"])
+        ema_slow_val = float(latest["ema_slow"])
+        ema_aligned_bull = ema_fast_val > ema_slow_val   # uptrend
+        ema_aligned_bear = ema_fast_val < ema_slow_val   # downtrend (for future SELL signals)
 
         # ── BUY conditions ─────────────────────────────────────────────────────
         plus_di  = float(latest["plus_di"])  if not pd.isna(latest["plus_di"])  else 0.0
@@ -174,19 +179,20 @@ class CommodityStrategy:
         vol_ratio = float(latest["vol_ratio"]) if not pd.isna(latest["vol_ratio"]) else 0.0
 
         buy_conditions = {
-            "ema_cross_above":  recent_cross_above,
+            "ema_aligned_bull": ema_aligned_bull,
             "adx_strong":       adx >= self.adx_threshold,
             "buyers_dominate":  plus_di > minus_di,
-            "price_above_slow": current_price > float(latest["ema_slow"]),
+            "price_above_slow": current_price > ema_slow_val,
             "volume_confirm":   vol_ratio >= self.volume_factor,
         }
 
         buy_score = sum(buy_conditions.values())
-        # Require 4/5 conditions — volume is soft (COMEX 1h yfinance data is sparse)
-        # Mandatory: ema_cross_above, adx_strong, buyers_dominate, price_above_slow
-        mandatory = buy_conditions["ema_cross_above"] and buy_conditions["adx_strong"] \
-                    and buy_conditions["buyers_dominate"] and buy_conditions["price_above_slow"]
-        if not mandatory or buy_score < 4:
+        # Mandatory: ema_aligned_bull, adx_strong, buyers_dominate (structural trend gates).
+        # Volume is soft — COMEX 1h volume data from yfinance is frequently zero/sparse.
+        # price_above_slow is soft — usually redundant with ema_aligned but not always.
+        mandatory = buy_conditions["ema_aligned_bull"] and buy_conditions["adx_strong"] \
+                    and buy_conditions["buyers_dominate"]
+        if not mandatory or buy_score < 3:
             logger.debug(
                 f"MCX {commodity}: {buy_score}/5 conditions "
                 f"({', '.join(k for k,v in buy_conditions.items() if not v)} missing)"
@@ -212,7 +218,7 @@ class CommodityStrategy:
             quantity   = LOT_SIZES.get(commodity, 1),
             product    = "NRML",
             reasoning  = (
-                f"MCX {commodity} trend signal: EMA20 crossed EMA50, "
+                f"MCX {commodity} trend signal: EMA20 above EMA50 (aligned bull), "
                 f"ADX={adx:.1f} (>{self.adx_threshold}), "
                 f"+DI={plus_di:.1f} > -DI={minus_di:.1f}, "
                 f"Vol={vol_ratio:.1f}× avg | "

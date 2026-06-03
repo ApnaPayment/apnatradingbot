@@ -631,9 +631,10 @@ def display_page(pathname, n_intervals):
             ])
 
             # Liquidity Engine trades (MCX + BSE paper)
-            liq_trades_df = db.get_liq_trades(limit=500)
-            liq_stats = db.get_liq_today_stats()
-            liq_status = db.get_liq_bot_status()
+            liq_trades_df  = db.get_liq_trades(limit=500)
+            liq_stats      = db.get_liq_today_stats()
+            liq_status     = db.get_liq_bot_status()
+            liq_decisions  = db.get_liq_decisions(limit=50)
 
             if not liq_trades_df.empty:
                 liq_display_cols = ["symbol", "exchange", "action", "strategy",
@@ -662,6 +663,72 @@ def display_page(pathname, n_intervals):
                 liq_table = html.Div("No liquidity engine trades yet",
                                      style={"color": "#888", "padding": "16px"})
 
+            # ── Liquidity signal log ──────────────────────────────────────────
+            if not liq_decisions.empty:
+                log_rows = []
+                for _, row in liq_decisions.iterrows():
+                    approved  = bool(row.get("approved", 0))
+                    icon      = "✅" if approved else "🚫"
+                    color     = "#00ff88" if approved else "#ff6666"
+                    symbol    = str(row.get("symbol", ""))
+                    action    = str(row.get("action", ""))
+                    price     = row.get("signal_price", 0) or 0
+                    ts        = str(row.get("decided_at", ""))[:16]
+                    reason    = str(row.get("veto_reason") or row.get("ai_reasoning") or "")[:80]
+                    outcome   = str(row.get("outcome") or "open")
+                    pnl_val   = row.get("outcome_pnl")
+                    pnl_str   = f" → ₹{pnl_val:+.2f}" if pnl_val is not None else ""
+                    pnl_color = "#00ff88" if (pnl_val or 0) > 0 else "#ff4444" if (pnl_val or 0) < 0 else "#aaa"
+                    log_rows.append(html.Div([
+                        html.Span(f"{icon} {ts}  ", style={"color": "#888", "fontSize": "11px"}),
+                        html.Span(f"{action} {symbol} @ ₹{price:.0f}  ", style={"color": color, "fontWeight": "600"}),
+                        html.Span(f"{outcome}{pnl_str}  ", style={"color": pnl_color}),
+                        html.Span(reason, style={"color": "#666", "fontSize": "11px"}),
+                    ], style={"padding": "4px 8px", "borderBottom": "1px solid #1e2430",
+                               "fontFamily": "Roboto Mono, monospace", "fontSize": "12px"}))
+                liq_signal_log = html.Div(log_rows,
+                    style={"backgroundColor": "#0d0f14", "border": "1px solid #2a3142",
+                           "borderRadius": "6px", "maxHeight": "300px", "overflowY": "auto",
+                           "marginBottom": "12px"})
+            else:
+                liq_signal_log = html.Div("No signals yet today",
+                    style={"color": "#888", "padding": "10px", "fontSize": "12px"})
+
+            # ── Open MCX positions ────────────────────────────────────────────
+            open_pos = liq_status.get("open_positions", {})
+            if open_pos:
+                pos_rows = []
+                for sym, pos in open_pos.items():
+                    entry  = pos.get("entry_price", 0)
+                    sl     = pos.get("stop_loss", 0)
+                    tgt    = pos.get("target", 0)
+                    qty    = pos.get("quantity", 1)
+                    act    = pos.get("action", "BUY")
+                    et     = str(pos.get("entry_time", ""))[:16]
+                    sl_dist = abs(entry - sl) / entry * 100 if entry else 0
+                    pos_rows.append(html.Tr([
+                        html.Td(sym, style={"color": "#ffd700"}),
+                        html.Td(act, style={"color": "#00ff88" if act == "BUY" else "#ff6666"}),
+                        html.Td(f"₹{entry:.2f}"),
+                        html.Td(f"₹{sl:.2f}", style={"color": "#ff4444"}),
+                        html.Td(f"₹{tgt:.2f}", style={"color": "#00ff88"}),
+                        html.Td(str(qty)),
+                        html.Td(f"{sl_dist:.1f}% to SL"),
+                        html.Td(et, style={"color": "#888", "fontSize": "11px"}),
+                    ], style={"borderBottom": "1px solid #1e2430"}))
+                _th = {"backgroundColor": "#1e2430", "color": "#4dabf7",
+                       "padding": "6px 10px", "fontFamily": "Roboto Mono, monospace", "fontSize": "12px"}
+                _td_style = {"backgroundColor": "#151a24", "color": "#e0e0e0",
+                             "padding": "5px 10px", "fontFamily": "Roboto Mono, monospace", "fontSize": "12px"}
+                open_pos_table = html.Table([
+                    html.Thead(html.Tr([html.Th(h, style=_th) for h in
+                        ["Symbol","Action","Entry","Stop Loss","Target","Qty","SL Distance","Entry Time"]])),
+                    html.Tbody(pos_rows, style=_td_style),
+                ], style={"width": "100%", "borderCollapse": "collapse", "marginBottom": "12px"})
+            else:
+                open_pos_table = html.Div("No open MCX positions",
+                    style={"color": "#888", "padding": "10px", "fontSize": "12px"})
+
             segments = ", ".join(liq_status.get("segments_active", [])) or "—"
             liq_section = html.Div([
                 html.H3("Liquidity Engine — MCX & BSE Paper Trades",
@@ -675,6 +742,14 @@ def display_page(pathname, n_intervals):
                               f"MCX: {liq_stats['mcx_trades']} | BSE: {liq_stats['bse_trades']}",
                               style={"color": "#aaa", "marginLeft": "16px"}),
                 ], style={"marginBottom": "8px", "fontSize": "13px"}),
+                html.Div("📋 Signal Log (latest 50)", style={"color": "#4dabf7", "fontSize": "13px",
+                                                              "fontWeight": "600", "marginBottom": "4px"}),
+                liq_signal_log,
+                html.Div("📌 Open Positions", style={"color": "#4dabf7", "fontSize": "13px",
+                                                      "fontWeight": "600", "margin": "12px 0 4px 0"}),
+                open_pos_table,
+                html.Div("📊 Completed Trades", style={"color": "#4dabf7", "fontSize": "13px",
+                                                        "fontWeight": "600", "margin": "12px 0 4px 0"}),
                 liq_table,
             ])
 
