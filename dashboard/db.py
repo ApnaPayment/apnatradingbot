@@ -14,9 +14,11 @@ DB_PATH = Path(__file__).parent.parent / "data" / "market_data.db"
 
 def get_conn():
     """Return a SQLite connection with WAL mode and busy timeout for concurrent access."""
-    conn = sqlite3.connect(DB_PATH, timeout=5)
+    conn = sqlite3.connect(DB_PATH, timeout=30)
     conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA busy_timeout=5000")
+    conn.execute("PRAGMA busy_timeout=30000")   # 30s — matches liquidity_db; bot writes take up to 3-4 min for scrip master but dashboard reads are short
+    conn.execute("PRAGMA synchronous=NORMAL")   # faster writes, safe with WAL
+    conn.row_factory = sqlite3.Row
     return conn
 
 
