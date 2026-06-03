@@ -7,6 +7,7 @@ Stores everything in SQLite for fast local access.
 import os
 import time
 import sqlite3
+import threading
 import logging
 import requests
 import pandas as pd
@@ -17,6 +18,11 @@ from pathlib import Path
 logger = logging.getLogger(__name__)
 
 DB_PATH = Path(__file__).parent.parent / "data" / "market_data.db"
+
+# Process-wide lock — serialises all DB writes within this process.
+# Prevents "database table is locked" when WebSocket tick thread and
+# main scheduler thread both try to write simultaneously.
+_DB_WRITE_LOCK = threading.Lock()
 
 
 class DataManager:
@@ -432,27 +438,34 @@ class DataManager:
 
     def _store_tick(self, quote: dict):
         """Store a tick in the database with retry on database lock."""
-        max_retries = 3
+        max_retries = 5
         for attempt in range(max_retries):
             try:
-                with self._get_conn() as conn:
-                    conn.execute(
-                        """INSERT INTO tick_data (symbol, exchange, timestamp, ltp, volume, bid, ask)
-                           VALUES (?, ?, ?, ?, ?, ?, ?)""",
-                        (quote["symbol"], quote["exchange"], quote["timestamp"],
-                         quote["ltp"], quote["volume"], quote["bid"], quote["ask"])
-                    )
-                    conn.commit()
+                with _DB_WRITE_LOCK:   # serialise within this process
+                    with self._get_conn() as conn:
+                        conn.execute(
+                            """INSERT INTO tick_data (symbol, exchange, timestamp, ltp, volume, bid, ask)
+                               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                            (quote["symbol"], quote["exchange"], quote["timestamp"],
+                             quote["ltp"], quote["volume"], quote["bid"], quote["ask"])
+                        )
+                        conn.commit()
                 return
             except sqlite3.IntegrityError as e:
                 logger.debug(f"Duplicate tick ignored: {e}")
                 return
             except sqlite3.OperationalError as e:
-                if "database is locked" in str(e) and attempt < max_retries - 1:
-                    time.sleep(0.1 * (2 ** attempt))  # Exponential backoff
+                # Catch BOTH "database is locked" (cross-process) AND
+                # "database table is locked" (cross-thread, same process)
+                err = str(e).lower()
+                if ("database is locked" in err or "database table is locked" in err) \
+                        and attempt < max_retries - 1:
+                    wait = 0.1 * (2 ** attempt)   # 0.1 → 0.2 → 0.4 → 0.8s
+                    logger.debug(f"Tick DB lock, retry {attempt+1} in {wait:.1f}s")
+                    time.sleep(wait)
                     continue
-                logger.error(f"Database error storing tick: {e}")
-                raise
+                logger.warning(f"Database error storing tick (giving up): {e}")
+                return  # drop tick rather than crash the WS handler
 
     # ─────────────────────────────────────────────────────────────────────────
     # OHLCV history
@@ -777,7 +790,7 @@ class DataManager:
             if missing:
                 raise ValueError(f"Missing required trade fields: {missing}")
 
-            with self._get_conn() as conn:
+            with _DB_WRITE_LOCK, self._get_conn() as conn:
                 conn.execute(
                     """INSERT INTO trades
                        (symbol, exchange, action, strategy, entry_price, exit_price,
@@ -839,7 +852,7 @@ class DataManager:
         """
         import json
         regime_data = regime_data or {}
-        with self._get_conn() as conn:
+        with _DB_WRITE_LOCK, self._get_conn() as conn:
             conn.execute(
                 """UPDATE bot_status SET
                    daily_pnl=?, daily_trades=?, open_positions=?,
@@ -895,7 +908,7 @@ class DataManager:
     def log_event(self, event_type: str, message: str, symbol: str = "", metadata: dict = None):
         """Log an event (signal, veto, execution, etc.) for dashboard feed."""
         import json
-        with self._get_conn() as conn:
+        with _DB_WRITE_LOCK, self._get_conn() as conn:
             conn.execute(
                 """INSERT INTO events (timestamp, event_type, message, symbol, metadata)
                    VALUES (?, ?, ?, ?, ?)""",
