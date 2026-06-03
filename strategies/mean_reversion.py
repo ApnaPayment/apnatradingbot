@@ -193,24 +193,9 @@ class MeanReversionStrategy:
 
         # SELL kept for live-bot logic only (no short positions in backtest)
         else:
-            sell_conditions = {
-                "near_upper_band":  bb_pct > 0.85,
-                "rsi_overbought":   rsi_now > self.rsi_overbought,
-                "rsi_turning_down": rsi_now < rsi_prev,
-                "volume_surge":     (not pd.isna(latest["vol_ratio"])
-                                     and float(latest["vol_ratio"]) > self.volume_factor),
-            }
-            sell_score = sum(sell_conditions.values())
-            if (sell_conditions["near_upper_band"] and sell_conditions["rsi_overbought"]
-                    and sell_score >= 3):
-                confidence = min(0.50 + sell_score * 0.08, 0.85)
-                signal = TradeSignal(
-                    symbol=symbol, exchange=exchange,
-                    action="SELL", price=current_price,
-                    strategy="mean_reversion",
-                    confidence=confidence,
-                    reasoning=self._build_reasoning("SELL", sell_conditions, latest),
-                )
+            # No SELL short positions in cash equity — Indian market constraint
+            # Overbought conditions detected but not traded; return None to skip
+            pass
 
         if signal:
             logger.info(

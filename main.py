@@ -925,9 +925,33 @@ class AlgoTrader:
             signal.confidence + ai_result.get("confidence_adjustment", 0)
         ))
         if ai_result.get("suggested_stop_loss"):
-            signal.stop_loss = ai_result["suggested_stop_loss"]
+            new_sl = float(ai_result["suggested_stop_loss"])
+            # Only accept if AI tightens (not widens) the risk-approved stop
+            # SELL: lower SL = tighter (premium must fall further to stop out)
+            # BUY:  higher SL = tighter (price must fall less to stop out)
+            sl_tightens = (new_sl <= signal.stop_loss) if signal.action == "SELL" \
+                          else (new_sl >= signal.stop_loss)
+            if sl_tightens:
+                logger.info(f"AI tightened SL: ₹{signal.stop_loss} → ₹{new_sl}")
+                signal.stop_loss = new_sl
+            else:
+                logger.warning(
+                    f"AI suggested wider SL ₹{new_sl} vs approved ₹{signal.stop_loss} — IGNORED"
+                )
         if ai_result.get("suggested_target"):
-            signal.target = ai_result["suggested_target"]
+            new_tgt = float(ai_result["suggested_target"])
+            # Only accept if AI improves (not worsens) the target
+            # SELL: higher target = better (premium must fall more before profit taken)
+            # BUY:  lower target = worse — reject; accept only if higher
+            tgt_improves = (new_tgt <= signal.target) if signal.action == "SELL" \
+                           else (new_tgt >= signal.target)
+            if tgt_improves:
+                logger.info(f"AI improved target: ₹{signal.target} → ₹{new_tgt}")
+                signal.target = new_tgt
+            else:
+                logger.warning(
+                    f"AI suggested worse target ₹{new_tgt} vs approved ₹{signal.target} — IGNORED"
+                )
 
         reasoning  = ai_result.get("reasoning", "")
         tools_used = ai_result.get("tools_used", [])
@@ -1303,10 +1327,12 @@ class AlgoTrader:
     def _exit_fo_position(self, symbol: str, pos: dict, exit_price: float, reason: str):
         """Exit an F&O (NRML) position and send Telegram alert."""
         try:
+            # Exit direction is opposite of entry: SELL position closes with BUY, and vice versa
+            _exit_tx = "B" if pos.get("action") == "SELL" else "S"
             self.client.place_order(
                 symbol=pos["symbol"],
                 exchange="nse_fo",
-                transaction_type="S",
+                transaction_type=_exit_tx,
                 quantity=pos["quantity"],
                 price=exit_price,
                 order_type="L",

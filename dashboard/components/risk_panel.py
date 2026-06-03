@@ -172,8 +172,9 @@ def risk_panel_component(bot_status=None, vix=None, fii_dii=None):
     capital_at_risk = bot_status.get("capital_at_risk", 0) or 0
     daily_pnl       = bot_status.get("daily_pnl", 0) or 0
     open_positions  = bot_status.get("open_positions", {}) or {}
-    max_capital   = 100_000
-    max_daily_loss= 10_000
+    import os
+    max_capital    = int(os.getenv("MAX_CAPITAL", "1000000"))   # ₹10L default — matches .env
+    max_daily_loss = max_capital * 0.03                          # 3% of actual capital
 
     # Capital gauge card
     capital_card = html.Div(children=[

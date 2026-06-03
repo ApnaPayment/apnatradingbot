@@ -180,28 +180,8 @@ class MomentumStrategy:
             )
 
         # SELL signals kept for live-bot exit logic (not traded in backtest)
-        # No SELL short positions — Indian equity markets constraint
-        else:
-            sell_conditions = {
-                "ema_crossover":  bool(latest["cross_below"]),
-                "rsi_overbought": bool(prev["rsi"] > self.rsi_overbought and latest["rsi"] < self.rsi_overbought),
-                "below_slow_ema": bool(current_price < latest["ema_slow"]),
-            }
-            sell_score = sum(sell_conditions.values())
-            if sell_conditions["ema_crossover"] and sell_score >= 2:
-                confidence = min(0.5 + (sell_score * 0.1), 0.90)
-                sl_sell   = round(current_price + 2 * atr, 2)   # stop above entry for SELL
-                tgt_sell  = round(current_price - 2 * (sl_sell - current_price), 2)  # 2:1 R:R
-                signal = TradeSignal(
-                    symbol=symbol, exchange=exchange,
-                    action="SELL", price=current_price,
-                    strategy="momentum",
-                    confidence=confidence,
-                    stop_loss=sl_sell,
-                    target=tgt_sell,
-                    product="CNC",
-                    reasoning=self._build_reasoning("SELL", sell_conditions, latest, atr),
-                )
+        # No SELL short positions in cash equity — Indian market constraint
+        # SELL conditions are detected but not traded; return None to skip
 
         if signal:
             logger.info(f"Signal: {signal.action} {symbol} @ ₹{current_price:.2f} | conf={signal.confidence:.0%}")

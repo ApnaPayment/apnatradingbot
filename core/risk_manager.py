@@ -168,12 +168,14 @@ class RiskManager:
         return True, ""
 
     def _check_max_positions(self, signal: TradeSignal) -> tuple[bool, str]:
-        if signal.action == "BUY" and len(self.open_positions) >= self.config.max_open_positions:
+        # Apply to ALL actions (BUY and SELL) — short options count against position limit
+        if len(self.open_positions) >= self.config.max_open_positions:
             return False, f"Max open positions reached ({self.config.max_open_positions})"
         return True, ""
 
     def _check_duplicate_position(self, signal: TradeSignal) -> tuple[bool, str]:
-        if signal.action == "BUY" and signal.symbol in self.open_positions:
+        # Apply to ALL actions — block duplicate regardless of direction
+        if signal.symbol in self.open_positions:
             return False, f"Already holding {signal.symbol}"
         return True, ""
 
