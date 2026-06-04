@@ -28,15 +28,23 @@ from core.risk_manager import TradeSignal
 
 logger = logging.getLogger(__name__)
 
-# ── V2 time-of-day gate ────────────────────────────────────────────────────────
+# ── Time-of-day gate ──────────────────────────────────────────────────────────
+# Extended to 11:30 — mean reversion setups at 10:30-11:00 (post-opening flush)
+# are often the most reliable (genuine capitulation, not opening noise).
 TRADE_START = dtime(9, 15)
-TRADE_END   = dtime(10, 30)
+TRADE_END   = dtime(11, 30)
 
-# ── V2 minimum ATR filter ─────────────────────────────────────────────────────
-MIN_ATR_PCT    = 0.0025   # 0.25% minimum ATR as fraction of price
+# ── Minimum ATR filter ────────────────────────────────────────────────────────
+MIN_ATR_PCT    = 0.0025
 
-# ── V2 BB width minimum ───────────────────────────────────────────────────────
+# ── BB width minimum ──────────────────────────────────────────────────────────
 MIN_BB_WIDTH   = 0.015    # 1.5% minimum Bollinger Band width
+
+# ── Regime requirement ────────────────────────────────────────────────────────
+# Mean reversion only works in ranging/sideways markets.
+# In strong trends, "oversold" keeps getting more oversold.
+# unknown regime = no trade.
+VALID_REGIMES = {"sideways", "ranging", "choppy"}
 
 
 class MeanReversionStrategy:
@@ -104,22 +112,33 @@ class MeanReversionStrategy:
     # ─────────────────────────────────────────────────────────────────────────
 
     def generate_signal(self, symbol: str, df: pd.DataFrame,
-                        exchange: str = "nse_cm") -> Optional[TradeSignal]:
+                        exchange: str = "nse_cm",
+                        regime: str = "unknown") -> Optional[TradeSignal]:
         """
-        V2: BB + RSI oversold bounce. Time-gated, ATR-filtered, tighter entry.
+        BB + RSI oversold bounce. Time-gated, regime-filtered, ATR-filtered.
 
-        Key V2 changes:
-          - Time gate 09:15–10:30 only
-          - ATR > 0.25% required (cost viability)
-          - BB width > 1.5% required (genuine volatility, not noise)
-          - RSI must be rising for 2 consecutive bars (not just 1)
-          - Target = 2×ATR above entry (was BB midline)
-          - Need 4 of 6 conditions (was 3 of 5)
+        Gates (in order):
+          0. Regime: only trade in sideways/ranging/choppy markets
+          1. Time-of-day: 09:15–11:30 (extended from 10:30)
+          2. ATR minimum: 0.25% of price
+          3. BB width minimum: 1.5% (genuine volatility, not tight ranging)
+          4. RSI must be rising 2 consecutive bars (confirmed bottom)
+          5. Need 4 of 6 conditions
+
+        Args:
+            regime: current market regime. Returns None if not sideways/ranging.
         """
+        # ── Gate 0: Regime filter ──────────────────────────────────────────
+        # In a trend, "oversold" RSI just means the trend is strong.
+        # Only trade bounces when market is genuinely ranging.
+        if regime not in VALID_REGIMES:
+            logger.debug(f"{symbol}: MR regime={regime} not ranging — skip")
+            return None
+
         if len(df) < self.bb_period + 10:
             return None
 
-        # ── V2 Gate 1: Time-of-day ─────────────────────────────────────────
+        # ── Gate 1: Time-of-day ────────────────────────────────────────────
         latest_ts = df.iloc[-1].get("timestamp")
         if latest_ts is not None:
             try:
@@ -208,21 +227,34 @@ class MeanReversionStrategy:
     # Watchlist scan
     # ─────────────────────────────────────────────────────────────────────────
 
-    def scan_watchlist(self, symbols: list, data_manager) -> list[TradeSignal]:
+    def scan_watchlist(self, symbols: list, data_manager,
+                       regime: str = "unknown") -> list[TradeSignal]:
+        """
+        Scan using 15-minute OHLCV bars. Only runs in sideways/ranging regime.
+
+        Mean reversion on 15m bars:
+          - BB(20) captures multi-hour range extremes, not 5m noise
+          - RSI(14) on 15m is less whippy — genuine oversold conditions
+          - Fewer false signals during trending periods
+        """
+        if regime not in VALID_REGIMES:
+            logger.info(f"MR scan skipped — regime={regime} not ranging/sideways")
+            return []
+
         signals = []
         for symbol in symbols:
             try:
-                df = data_manager.get_ohlcv(symbol, limit=300)
-                if df.empty:
+                df = data_manager.get_ohlcv_15m(symbol)
+                if df is None or df.empty:
                     continue
-                sig = self.generate_signal(symbol, df)
+                sig = self.generate_signal(symbol, df, regime=regime)
                 if sig:
                     signals.append(sig)
             except Exception as e:
                 logger.error(f"MR scan error {symbol}: {e}")
 
         signals.sort(key=lambda s: s.confidence, reverse=True)
-        logger.info(f"MR scan: {len(signals)} signals from {len(symbols)} symbols")
+        logger.info(f"MR scan: {len(signals)} signals from {len(symbols)} symbols (15m bars, regime={regime})")
         return signals
 
     # ─────────────────────────────────────────────────────────────────────────

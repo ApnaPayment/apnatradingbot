@@ -280,6 +280,9 @@ class AlgoTrader:
         # ── Bug Fix: restore open_positions and daily_pnl from DB before first cycle ──
         # Without this, a restart zeros daily_pnl (bypasses loss limit) and loses
         # all open position references (no stop-loss monitoring after crash/restart).
+        # FIX 5+6: Wire data_manager into risk so it can persist counters immediately
+        # after every entry/exit (not just at next 5-min cycle).
+        self.risk._data_manager = self.data
         self.risk.restore_from_db(self.data)
         self._restore_cooldowns()  # Restore SL/veto cooldowns so signal spam protection survives restart
 
@@ -596,7 +599,19 @@ class AlgoTrader:
                 logger.error(f"Failed to update bot status: {e}")
                 # Continue anyway, not critical
 
-            # Equity signals via aggregator (regime-weighted)
+            # ── FIX 1: Regime gate — block ALL new entries if regime unknown ────
+            # unknown = regime detection failed or bot just started.
+            # Trading blind (unknown regime) caused the SELL CE disaster on Jun 3.
+            # Exits and position monitoring continue regardless.
+            if self._market_regime == "unknown":
+                logger.warning(
+                    "Regime=UNKNOWN — no new entries until regime is confirmed. "
+                    "Exits and monitoring still active."
+                )
+                self.data.log_event("CYCLE", f"Regime=unknown — new entries blocked")
+                return
+
+            # Equity signals via aggregator (regime-weighted, 15m bars via strategy)
             try:
                 signals = self.aggregator.scan_and_aggregate(
                     self.active_watchlist, self.data, regime=self._market_regime
@@ -611,14 +626,19 @@ class AlgoTrader:
                 logger.info(f"Mode=DEFENSIVE — no new equity signals (exits only)")
                 signals = []
 
-            # F&O options — enter when regime is trending (local or AI-detected)
+            # F&O options — regime must be known AND trending (both checks explicit)
             _local_regime = self.data.detect_regime("NIFTYBEES-EQ")
             logger.info(
                 f"Regime check — AI: {self._market_regime} | Local: {_local_regime} | "
                 f"Mode: {self._trading_mode.value}"
             )
-            _run_options = (self._market_regime in ("trending_up", "trending_down") or
-                            _local_regime in ("trending_up", "trending_down"))
+            # FIX 7: options also require known regime. Never trade options blind.
+            _options_regime_ok = (
+                self._market_regime not in ("unknown",)
+                and (self._market_regime in ("trending_up", "trending_down")
+                     or _local_regime in ("trending_up", "trending_down"))
+            )
+            _run_options = _options_regime_ok
             # CAUTION/DEFENSIVE: no new short options (gamma risk too high)
             if self._trading_mode in (TradingMode.CAUTION, TradingMode.DEFENSIVE):
                 _run_options = False

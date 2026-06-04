@@ -27,15 +27,23 @@ from core.risk_manager import TradeSignal
 
 logger = logging.getLogger(__name__)
 
-# ── V2 time-of-day gate ────────────────────────────────────────────────────────
-# Only trade in the first 75 minutes. Evidence: win rate collapses after 10:30.
+# ── Time-of-day gate ──────────────────────────────────────────────────────────
+# Extended from 10:30 → 11:30. Evidence showed 9% WR at 11h (still positive).
+# The 10:30 cutoff was overly conservative — it missed genuine breakouts at 10:45-11:30
+# after opening noise settles and a clear trend emerges.
 TRADE_START = dtime(9, 15)
-TRADE_END   = dtime(10, 30)
+TRADE_END   = dtime(11, 30)
 
-# ── V2 minimum ATR filter ─────────────────────────────────────────────────────
-# Skip if 5m ATR < 0.25% of price. Costs (₹52) need 2.5×ATR to break even;
-# below this threshold the trade is structurally unviable regardless of signal.
+# ── Minimum ATR filter ────────────────────────────────────────────────────────
+# Skip if 15m ATR < 0.25% of price. On 15m bars, ATR is naturally ~3× larger
+# than 5m ATR, so the ₹52 breakeven threshold is comfortably cleared.
 MIN_ATR_PCT = 0.0025
+
+# ── Regime requirement ────────────────────────────────────────────────────────
+# Momentum only works in trending markets. In ranging/sideways regimes,
+# EMA crossovers are false breakouts that immediately reverse.
+# unknown regime = no trade (safer than trading blind).
+VALID_REGIMES = {"trending_up", "trending_down"}
 
 
 class MomentumStrategy:
@@ -104,22 +112,34 @@ class MomentumStrategy:
     # ─────────────────────────────────────────────────────────────────────────
 
     def generate_signal(self, symbol: str, df: pd.DataFrame,
-                        exchange: str = "nse_cm") -> Optional[TradeSignal]:
+                        exchange: str = "nse_cm",
+                        regime: str = "unknown") -> Optional[TradeSignal]:
         """
         Analyze OHLCV data and return a TradeSignal if conditions are met.
         Returns None if no clear signal.
 
-        V2 gates applied before any indicator computation:
-          1. Time-of-day: only 09:15–10:30
-          2. ATR minimum: skip low-volatility candles
-          3. above_slow_ema mandatory (not optional)
-          4. volume_factor = 2.0× (was 1.5×)
+        Gates (in order):
+          0. Regime: only trade in trending_up or trending_down
+          1. Time-of-day: 09:15–11:30 (extended from 10:30)
+          2. ATR minimum: skip low-volatility bars
+          3. above_slow_ema mandatory (never buy below EMA-21)
+          4. volume_factor = 2.0× (genuine breakout confirmation)
+
+        Args:
+            regime: current market regime string. Pass from bot — strategy
+                    returns None if regime doesn't match (saves AI API calls).
         """
+        # ── Gate 0: Regime filter ──────────────────────────────────────────
+        # Momentum needs a trend to ride. Ranging/unknown = no trade.
+        if regime not in VALID_REGIMES:
+            logger.debug(f"{symbol}: regime={regime} not in {VALID_REGIMES} — skip")
+            return None
+
         if len(df) < self.slow_ema + 10:
             logger.debug(f"{symbol}: Not enough data ({len(df)} candles)")
             return None
 
-        # ── V2 Gate 1: Time-of-day ─────────────────────────────────────────
+        # ── Gate 1: Time-of-day ────────────────────────────────────────────
         latest_ts = df.iloc[-1].get("timestamp")
         if latest_ts is not None:
             try:
@@ -192,26 +212,36 @@ class MomentumStrategy:
     # Scan multiple symbols
     # ─────────────────────────────────────────────────────────────────────────
 
-    def scan_watchlist(self, symbols: list, data_manager) -> list[TradeSignal]:
+    def scan_watchlist(self, symbols: list, data_manager,
+                       regime: str = "unknown") -> list[TradeSignal]:
         """
-        Scan a list of symbols and return all valid signals.
-        Ranked by confidence score.
+        Scan watchlist using 15-minute OHLCV bars for cleaner signals.
+
+        15m bars vs 5m bars:
+          - 3× larger ATR → easily clears ₹52 cost breakeven
+          - EMA crossovers capture real structure (not 5m noise)
+          - Fewer signals, each higher quality
+          - After crossover, move is just starting (not already 80% done)
         """
+        # Fast-exit: if regime not valid, skip entire scan (saves API + compute)
+        if regime not in VALID_REGIMES:
+            logger.info(f"Momentum scan skipped — regime={regime} not trending")
+            return []
+
         signals = []
         for symbol in symbols:
             try:
-                df = data_manager.get_ohlcv(symbol, limit=300)
-                if df.empty:
+                df = data_manager.get_ohlcv_15m(symbol)
+                if df is None or df.empty:
                     continue
-                signal = self.generate_signal(symbol, df)
+                signal = self.generate_signal(symbol, df, regime=regime)
                 if signal:
                     signals.append(signal)
             except Exception as e:
                 logger.error(f"Error scanning {symbol}: {e}")
 
-        # Sort by confidence descending
         signals.sort(key=lambda s: s.confidence, reverse=True)
-        logger.info(f"Scan complete: {len(signals)} signals from {len(symbols)} symbols")
+        logger.info(f"Momentum scan: {len(signals)} signals from {len(symbols)} symbols (15m bars, regime={regime})")
         return signals
 
     # ─────────────────────────────────────────────────────────────────────────

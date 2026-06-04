@@ -74,7 +74,14 @@ class SignalAggregator:
         for name, (strategy, _) in self.strategies.items():
             w = weights.get(name, 0.5)
             try:
-                raw_signals = strategy.scan_watchlist(symbols, data_manager)
+                # Pass regime so strategies self-filter (momentum skips in ranging,
+                # mean-reversion skips in trending) — avoids wasting AI API calls
+                import inspect as _inspect
+                _sw = strategy.scan_watchlist
+                if "regime" in _inspect.signature(_sw).parameters:
+                    raw_signals = _sw(symbols, data_manager, regime=regime)
+                else:
+                    raw_signals = _sw(symbols, data_manager)
             except Exception as e:
                 logger.error(f"Strategy '{name}' scan failed: {e}")
                 continue

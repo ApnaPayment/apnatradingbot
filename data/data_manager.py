@@ -611,6 +611,43 @@ class DataManager:
         df["timestamp"] = pd.to_datetime(df["timestamp"], format="mixed")
         return df.sort_values("timestamp").reset_index(drop=True)
 
+    def get_ohlcv_15m(self, symbol: str, exchange: str = "nse_cm",
+                      limit: int = 120) -> pd.DataFrame:
+        """
+        Return 15-minute OHLCV bars by aggregating 5-minute bars from DB.
+
+        Fetches limit×3 five-minute bars, resamples to 15m, returns `limit` bars.
+        Falls back to 5m bars if fewer than 15 candles exist (not enough to resample).
+
+        Why 15m for signal generation:
+          - ATR is ~3× larger → clears ₹52 brokerage cost threshold easily
+          - EMA crossovers capture real structure, not 5-minute noise
+          - After crossover fires, the move is just starting (not 80% done)
+          - Fewer signals, each with higher quality and better win rate
+        """
+        # Fetch enough 5m bars to produce `limit` 15m bars (3 five-min bars = 1 fifteen-min bar)
+        df5 = self.get_ohlcv(symbol, exchange, limit=limit * 3 + 10)
+        if df5.empty or len(df5) < 15:
+            # Not enough data for meaningful 15m bars — fall back to 5m
+            logger.debug(f"get_ohlcv_15m: {symbol} insufficient 5m data ({len(df5)} bars), using raw")
+            return df5
+
+        df5 = df5.copy()
+        df5["timestamp"] = pd.to_datetime(df5["timestamp"], format="mixed")
+        df5 = df5.set_index("timestamp").sort_index()
+
+        df15 = df5.resample("15min").agg(
+            open=("open", "first"),
+            high=("high", "max"),
+            low=("low", "min"),
+            close=("close", "last"),
+            volume=("volume", "sum"),
+        ).dropna(subset=["open", "close"])
+
+        df15 = df15.reset_index()
+        df15 = df15.tail(limit).reset_index(drop=True)
+        return df15
+
     def build_candle_from_ticks(self, symbol: str, exchange: str,
                                  interval_minutes: int = 5):
         """Aggregate tick data into OHLCV candles. Only processes ticks newer than latest candle."""
@@ -948,6 +985,20 @@ class DataManager:
                     json.dumps(portfolio.get("cooldowns", {})),
                     portfolio.get("weekly_pnl", 0),
                 ),
+            )
+
+    def persist_risk_counters(self, daily_pnl: float, weekly_pnl: float,
+                              daily_trades: int) -> None:
+        """
+        Immediately write P&L counters to bot_status.
+        Called by RiskManager after every entry/exit — not just at 5-min cycle.
+        Ensures daily_trades, daily_pnl, weekly_pnl survive a mid-day restart.
+        """
+        with _WRITE_CONN as conn:
+            conn.execute(
+                """UPDATE bot_status SET daily_pnl=?, weekly_pnl=?, daily_trades=?
+                   WHERE id=1""",
+                (round(daily_pnl, 2), round(weekly_pnl, 2), daily_trades)
             )
 
     def get_bot_status(self) -> dict:

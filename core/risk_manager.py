@@ -55,6 +55,7 @@ class RiskManager:
         self.weekly_pnl: float = 0.0         # resets every Monday — SOP weekly hard stop
         self.daily_trades: int = 0
         self.today: date = date.today()
+        self._data_manager = None            # set by main.py after init for immediate persistence
 
     def restore_from_db(self, data_manager) -> None:
         """
@@ -406,6 +407,8 @@ class RiskManager:
         }
         self.daily_trades += 1
         logger.info(f"Position recorded: {signal.symbol} @ ₹{signal.price}")
+        # FIX 5: Persist immediately so daily_trades survives a mid-day restart
+        self._persist_counters()
 
     def record_exit(self, symbol: str, exit_price: float):
         """Record position close and update daily P&L."""
@@ -423,7 +426,26 @@ class RiskManager:
             f"Position closed: {symbol} P&L=₹{pnl:.0f} | "
             f"Daily=₹{self.daily_pnl:.0f} | Weekly=₹{self.weekly_pnl:.0f}"
         )
+        # FIX 6: Persist immediately so weekly_pnl and daily_pnl survive restarts
+        self._persist_counters()
         return pnl
+
+    def _persist_counters(self):
+        """
+        Immediately write daily_pnl, weekly_pnl, daily_trades to DB.
+        Called after every entry and exit — not just at next 5-min cycle.
+        Prevents counter loss if bot restarts between cycles.
+        """
+        if self._data_manager is None:
+            return
+        try:
+            self._data_manager.persist_risk_counters(
+                daily_pnl=self.daily_pnl,
+                weekly_pnl=self.weekly_pnl,
+                daily_trades=self.daily_trades,
+            )
+        except Exception as e:
+            logger.warning(f"_persist_counters failed (non-critical): {e}")
 
     def check_stop_loss_hit(self, symbol: str, current_price: float) -> bool:
         """Returns True if stop loss has been hit for a position."""
