@@ -40,7 +40,11 @@ from data.data_manager import DataManager
 from data.liquidity_db import LiquidityDataManager as _LiqDB
 from strategies.momentum import MomentumStrategy
 from strategies.mean_reversion import MeanReversionStrategy
-from strategies.options import OptionsStrategy, STOP_LOSS_PCT as _OPT_SL_PCT, TARGET_PCT as _OPT_TGT_PCT
+from strategies.options import (
+    OptionsStrategy,
+    SELL_STOP_PCT   as _OPT_SL_PCT,   # renamed: STOP_LOSS_PCT → SELL_STOP_PCT
+    SELL_TARGET_PCT as _OPT_TGT_PCT,  # renamed: TARGET_PCT    → SELL_TARGET_PCT
+)
 from strategies.stock_options import StockOptionsStrategy, STOCK_OPTIONS_CONFIG
 from ai.decision_engine import AIDecisionEngine
 from ai.signal_aggregator import SignalAggregator
